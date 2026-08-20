@@ -61,3 +61,11 @@ Thumbs.db
 *.wav
 *.m4a
 !/public/**/*.mp4
+
+# sync artifacts / 待刪資料夾(本機清理用)
+/_sync
+/_to_delete
+*.bundle
+50cut.zip
+# ffmpeg worker 是 node_modules 的複製品,不入版控
+/public/ffmpeg

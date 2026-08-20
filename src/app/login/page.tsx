@@ -26,7 +26,7 @@ export default function LoginPage() {
 
     if (error) {
       setStatus('error');
-      setErrorMsg('寄送失敗,請稍後再試');
+      setErrorMsg('寄送失敗，請稍後再試');
       return;
     }
     setStatus('sent');
@@ -53,15 +53,15 @@ export default function LoginPage() {
           <>
             <button
               onClick={signInWithGoogle}
-              className="w-full py-3 mb-4 rounded-xl bg-white text-black font-medium hover:opacity-90 transition"
+              className="w-full py-3 mb-4 rounded-xl bg-white text-black font-medium hover:opacity-90 transition tracking-wide"
             >
-              使用 Google 繼續
+              用 Google 登入
             </button>
 
             <div className="flex items-center gap-3 my-6">
-              <div className="flex-1 h-px bg-white/20" />
-              <span className="text-xs opacity-40">或</span>
-              <div className="flex-1 h-px bg-white/20" />
+              <div className="flex-1 h-px bg-white/15" />
+              <span className="text-[11px] uppercase tracking-widest opacity-40">或</span>
+              <div className="flex-1 h-px bg-white/15" />
             </div>
           </>
         )}
@@ -75,20 +75,20 @@ export default function LoginPage() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               autoComplete="email"
-              className="w-full px-4 py-3 mb-3 rounded-xl bg-white/10 border border-white/10 focus:outline-none focus:border-white/40"
+              className="w-full px-4 py-3 mb-3 rounded-xl bg-white/[0.07] border border-white/10 focus:outline-none focus:border-white/40 transition"
             />
             <button
               type="submit"
               disabled={status === 'sending'}
-              className="w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 disabled:opacity-50 transition"
+              className="w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 disabled:opacity-50 transition tracking-wide"
             >
-              {status === 'sending' ? '寄送中...' : '寄登入連結到信箱'}
+              {status === 'sending' ? '寄出中' : '寄登入連結到信箱'}
             </button>
           </form>
         ) : (
-          <div className="text-center opacity-70 py-6">
-            <p className="mb-2">📧 已寄出登入連結</p>
-            <p className="text-sm opacity-60">請到 {email} 收信</p>
+          <div className="text-center py-6">
+            <p className="text-[11px] uppercase tracking-widest opacity-40 mb-3">登入連結已寄出</p>
+            <p className="text-sm">請到 <span className="opacity-80">{email}</span> 收信</p>
           </div>
         )}
 
@@ -97,7 +97,7 @@ export default function LoginPage() {
         <p className="mt-8 text-xs opacity-40 text-center leading-relaxed">
           登入即代表同意我們的服務條款。
           <br />
-          我們只儲存 Email 和用量,不儲存你的影片。
+          我們只存 Email 和用量，不存你的影片。
         </p>
       </div>
     </main>

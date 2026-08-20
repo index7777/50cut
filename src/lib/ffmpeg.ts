@@ -61,13 +61,16 @@ export async function extractAudio(
   try {
     await ffmpeg.writeFile(inputName, await fetchFile(file));
 
-    // -vn: 去影像;-ac 1: 單聲道;-ar 16000: 16kHz(Whisper 最佳);-b:a 32k: 低碼率省頻寬
+    // -vn: 去影像；-ac 1: 單聲道；-ar 16000: 16kHz(Whisper 最佳);-b:a 64k: 兼顧壓縮與辨識品質
+    // -af: 高通去低頻噪(冷氣/風聲)+ 動態壓縮拉高人聲，幫 Whisper 認得更準
     await ffmpeg.exec([
       '-i', inputName,
       '-vn',
       '-ac', '1',
       '-ar', '16000',
-      '-b:a', '32k',
+      // 只高通去低頻噪(80Hz 以下鼓聲/BGM 貝斯)，不動態壓縮避免把 BGM 拉到語音音量誤導 Whisper
+      '-af', 'highpass=f=80',
+      '-b:a', '64k',
       '-f', 'mp3',
       outputName,
     ]);
@@ -77,7 +80,7 @@ export async function extractAudio(
     try { await ffmpeg.deleteFile(inputName); } catch {}
     try { await ffmpeg.deleteFile(outputName); } catch {}
 
-    return new Blob([data], { type: 'audio/mpeg' });
+    return new Blob([data as BlobPart], { type: 'audio/mpeg' });
   } finally {
     ffmpeg.off('progress', progressHandler);
   }

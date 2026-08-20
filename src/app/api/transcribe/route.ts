@@ -4,13 +4,18 @@ import { createAdminClient } from '@/lib/supabase/admin';
 import { checkRateLimit, getClientIp } from '@/lib/ratelimit';
 import { log } from '@/lib/logger';
 import { isUnlimitedEmail } from '@/lib/auth-helpers';
-import type { TranscribeResponse, ApiError } from '@/lib/types';
+import type {
+  TranscribeResponse,
+  ApiError,
+  TranscriptWord,
+  TimingSource,
+} from '@/lib/types';
 
 // Whisper 需要 Node 環境(FormData + fetch to OpenAI)
 export const runtime = 'nodejs';
 export const maxDuration = 60;   // Vercel 限制
 
-// 音訊上限:5 分鐘 16kHz mono 32kbps ≈ 1.2 MB。給到 5 MB 保險。
+// 音訊上限：5 分鐘 16kHz mono 32kbps ≈ 1.2 MB。給到 5 MB 保險。
 const MAX_AUDIO_BYTES = 5 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
@@ -32,7 +37,7 @@ export async function POST(request: NextRequest) {
   if (!ipCheck.allowed || !userCheck.allowed) {
     log.warn('rate_limited', { u: log.userHash(user.id) });
     return NextResponse.json<ApiError>(
-      { error: '太頻繁了,稍後再試', code: 'rate_limited' },
+      { error: '太頻繁了，稍後再試', code: 'rate_limited' },
       { status: 429 }
     );
   }
@@ -45,8 +50,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json<ApiError>({ error: '請求格式錯誤', code: 'bad_request' }, { status: 400 });
   }
 
-  const audio = form.get('audio');
-  if (!(audio instanceof File) && !(audio instanceof Blob)) {
+  const audio = form.get('audio') as File | Blob | null;
+  if (!audio || typeof (audio as Blob).size !== 'number') {
     return NextResponse.json<ApiError>({ error: '缺少音訊', code: 'no_audio' }, { status: 400 });
   }
   if (audio.size > MAX_AUDIO_BYTES) {
@@ -65,12 +70,12 @@ export async function POST(request: NextRequest) {
 
     if (usageErr) {
       log.error('consume_usage_failed', { u: log.userHash(user.id), err: usageErr.message });
-      return NextResponse.json<ApiError>({ error: '系統忙線,請重試', code: 'usage_error' }, { status: 500 });
+      return NextResponse.json<ApiError>({ error: '系統忙線，請重試', code: 'usage_error' }, { status: 500 });
     }
     const row = Array.isArray(usage) ? usage[0] : usage;
     if (!row?.allowed) {
       return NextResponse.json<ApiError>(
-        { error: '今日免費額度已用完,明天再試', code: 'daily_limit' },
+        { error: '今日免費額度已用完，明天再試', code: 'daily_limit' },
         { status: 402 }
       );
     }
@@ -94,12 +99,14 @@ export async function POST(request: NextRequest) {
   whisperForm.append('model', 'whisper-large-v3-turbo');
   whisperForm.append('response_format', 'verbose_json');
   whisperForm.append('language', 'zh');
-  // 要逐字時間戳,server 端再切成句子
+  // 要最細粒度的時間戳。segment 只當 fallback,實際字幕由 subtitleSegmenter
+  // 依 word timestamp 切分(見 src/lib/subtitle-segmenter.ts)
   whisperForm.append('timestamp_granularities[]', 'segment');
   whisperForm.append('timestamp_granularities[]', 'word');
+  whisperForm.append('temperature', '0');
   whisperForm.append(
     'prompt',
-    '以下是繁體中文對話,請以台灣用語標點,常見詞:視頻→影片、質量→品質。'
+    '以下是繁體中文對話，請以台灣用語標點。常見詞：視頻→影片、質量→品質。請完整轉錄所有聽到的內容，包含短句、語助詞、口頭禪。'
   );
 
   let whisperJson: {
@@ -107,7 +114,7 @@ export async function POST(request: NextRequest) {
     duration?: number;
     text?: string;
     segments?: { start: number; end: number; text: string }[];
-    words?: { start: number; end: number; word: string }[];
+    words?: { start?: number; end?: number; word?: string; text?: string }[];
   };
   try {
     const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -119,7 +126,7 @@ export async function POST(request: NextRequest) {
       const errText = await resp.text().catch(() => '');
       log.error('whisper_failed', { status: resp.status, snippet: errText.slice(0, 200) });
       return NextResponse.json<ApiError>(
-        { error: '辨識失敗,再試一次', code: 'whisper_error' },
+        { error: '辨識失敗，再試一次', code: 'whisper_error' },
         { status: 502 }
       );
     }
@@ -127,36 +134,58 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     log.error('whisper_network_error', { msg: (err as Error).message });
     return NextResponse.json<ApiError>(
-      { error: '網路錯誤,再試一次', code: 'network_error' },
+      { error: '網路錯誤，再試一次', code: 'network_error' },
       { status: 502 }
     );
   }
 
-  // 6. 用逐字時間戳依標點切成句子
-  //    Whisper 對長句常回一大段,我們自己依中英標點切,方便 Gemini 挑亮點對齊
-  const rawSegments = (whisperJson.segments ?? []).map((s) => ({
-    start: s.start,
-    end: s.end,
-    text: s.text.trim(),
-  }));
-  const words = (whisperJson.words ?? []).filter(
-    (w) => typeof w.start === 'number' && typeof w.end === 'number'
-  );
+  // 6. 回傳「最細粒度」的時間戳。
+  //    這裡不做任何斷句 —— 字幕切分交給 deterministic 的 subtitleSegmenter,
+  //    這樣 AI 與 API 都不可能左右字幕邊界。
+  const segments = (whisperJson.segments ?? [])
+    .filter((s) => typeof s.start === 'number' && typeof s.end === 'number')
+    .map((s) => ({
+      start: s.start,
+      end: s.end,
+      text: (s.text ?? '').trim(),
+    }))
+    .filter((s) => s.text.length > 0);
 
-  const segments = splitBySentence(rawSegments, words);
+  // Groq/OpenAI 的 word 物件欄位名可能是 word 或 text,兩者都接受。
+  const words: TranscriptWord[] = (whisperJson.words ?? [])
+    .map((w) => {
+      const raw = w as { start?: number; end?: number; word?: string; text?: string };
+      return {
+        text: (raw.word ?? raw.text ?? '').trim(),
+        start: raw.start ?? Number.NaN,
+        end: raw.end ?? Number.NaN,
+      };
+    })
+    .filter(
+      (w) =>
+        Number.isFinite(w.start) &&
+        Number.isFinite(w.end) &&
+        w.end >= w.start &&
+        w.text.length > 0
+    )
+    .sort((a, b) => a.start - b.start);
+
+  const timingSource: TimingSource = words.length > 0 ? 'exact' : 'estimated';
 
   const payload: TranscribeResponse = {
     language: whisperJson.language ?? 'zh',
     duration: whisperJson.duration ?? 0,
+    words,
     segments,
-    full_text: whisperJson.text?.trim() ?? '',
+    timingSource,
+    full_text: (whisperJson.text ?? '').trim(),
   };
 
   log.info('transcribe_ok', {
     u: log.userHash(user.id),
-    raw_segments: rawSegments.length,
     words: words.length,
-    final_segments: segments.length,
+    segments: segments.length,
+    timing_source: timingSource,
     duration: payload.duration,
     full_text_len: payload.full_text.length,
   });
@@ -167,113 +196,4 @@ export async function POST(request: NextRequest) {
 // 拒絕其他方法
 export async function GET() {
   return NextResponse.json<ApiError>({ error: 'method_not_allowed' }, { status: 405 });
-}
-
-// ============================================================
-// Helpers
-// ============================================================
-
-const SENTENCE_END = /[。!?!?…]|\.(\s|$)/;
-
-/**
- * 把 Whisper 回傳的大段落依標點+逐字時間戳切成短句。
- * 若沒有逐字時間戳,fallback 用字元比例分配時間。
- */
-function splitBySentence(
-  rawSegments: { start: number; end: number; text: string }[],
-  words: { start: number; end: number; word: string }[]
-): { start: number; end: number; text: string }[] {
-  const results: { start: number; end: number; text: string }[] = [];
-
-  // 有逐字時間戳:重建整段文字→依標點切→每句 char range 對應到 word 找起訖
-  if (words.length > 0) {
-    // 預先算每個 word 在 joinedText 的 char 位置
-    const wordPos: { start: number; end: number; wStart: number; wEnd: number }[] = [];
-    let pos = 0;
-    for (const w of words) {
-      const len = w.word.length;
-      wordPos.push({ start: w.start, end: w.end, wStart: pos, wEnd: pos + len });
-      pos += len;
-    }
-    const joinedText = words.map((w) => w.word).join('');
-    const sentences = splitTextIntoSentences(joinedText);
-
-    let sentCharStart = 0;
-    for (const sent of sentences) {
-      const sentCharEnd = sentCharStart + sent.length;
-      let firstWord = -1;
-      let lastWord = -1;
-      for (let i = 0; i < wordPos.length; i++) {
-        // 有交集就算命中
-        if (wordPos[i].wEnd > sentCharStart && wordPos[i].wStart < sentCharEnd) {
-          if (firstWord === -1) firstWord = i;
-          lastWord = i;
-        } else if (wordPos[i].wStart >= sentCharEnd) {
-          break;
-        }
-      }
-      if (firstWord !== -1 && lastWord !== -1) {
-        results.push({
-          start: wordPos[firstWord].start,
-          end: wordPos[lastWord].end,
-          text: sent.trim(),
-        });
-      }
-      sentCharStart = sentCharEnd;
-    }
-
-    if (results.length > 0) return mergeShort(results);
-  }
-
-  // Fallback:沒逐字時間戳 → 每個 segment 依標點切,時間按字元比例分配
-  for (const seg of rawSegments) {
-    const parts = splitTextIntoSentences(seg.text);
-    if (parts.length <= 1) {
-      results.push(seg);
-      continue;
-    }
-    const totalLen = parts.reduce((a, p) => a + p.length, 0) || 1;
-    const dur = seg.end - seg.start;
-    let cursor = seg.start;
-    for (const p of parts) {
-      const partDur = (p.length / totalLen) * dur;
-      results.push({
-        start: cursor,
-        end: cursor + partDur,
-        text: p.trim(),
-      });
-      cursor += partDur;
-    }
-  }
-
-  return mergeShort(results);
-}
-
-function splitTextIntoSentences(text: string): string[] {
-  const out: string[] = [];
-  let buf = '';
-  for (let i = 0; i < text.length; i++) {
-    buf += text[i];
-    if (SENTENCE_END.test(text[i])) {
-      out.push(buf);
-      buf = '';
-    }
-  }
-  if (buf.trim()) out.push(buf);
-  return out.filter((s) => s.trim().length > 0);
-}
-
-// 合併過短的句子(<3 字)避免時間戳雜訊
-function mergeShort(segs: { start: number; end: number; text: string }[]) {
-  const out: typeof segs = [];
-  for (const s of segs) {
-    if (s.text.length < 3 && out.length > 0) {
-      const prev = out[out.length - 1];
-      prev.end = s.end;
-      prev.text = (prev.text + s.text).trim();
-    } else {
-      out.push({ ...s });
-    }
-  }
-  return out;
 }

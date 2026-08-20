@@ -26,9 +26,13 @@
 [ffmpeg.wasm 前端抽音訊]         ← 影片留本機
      ↓  只上傳 MP3(~1.2MB)
 [/api/transcribe → Groq Whisper] ← 免費 6000/day
-     ↓ 逐字時間戳 + 依標點切句
-[/api/highlight → Gemini]        ← 免費 1500/day
-     ↓ 亮點時間 + 標題 + hashtag
+     ↓ word-level timestamp(最細粒度,不做斷句)
+[subtitleSegmenter(本機、deterministic)]
+     ↓ SubtitleCue[]:邊界一律取自 word 的真實時間
+[/api/proofread → Gemini]        ← 只回文字 patch,不碰時間
+     ↓
+[/api/highlight → Gemini]        ← 系統產生候選,AI 只回 candidateId
+     ↓ 亮點時間(取自候選)+ 標題 + hashtag
 [ffmpeg.wasm 前端切片+燒字幕]    ← 用 Noto Sans TC (IndexedDB 快取)
      ↓
 [使用者下載 MP4]
@@ -73,6 +77,16 @@
 - ✅ 影片預覽 + 下載 MP4
 - ✅ 無限白名單機制(`UNLIMITED_EMAILS` env var)
 - ✅ 資安 headers(COOP/COEP/X-Frame-Options/CSP-lite)
+- ✅ **細粒度字幕時間軸**:用 Whisper word-level timestamp,deterministic segmenter 切 cue
+- ✅ **一鍵流程**:選檔 → 處理中(階段清單)→ 完成頁,主 CTA 是下載;編輯器降為第二層
+- ✅ **選片改為候選 + AI ranking**:系統產生對齊語句邊界的候選,Gemini 只回 id
+- ✅ **Gemini 校字改 patch 模式**:只回 {index, from, to},不得改動時間軸
+- ✅ 時間軸編輯器:波形、橫向軌道、毫秒微調、依波形自動切(可預覽/還原)
+- ✅ 個人字典自動學習(從使用者實際修改 diff 出對照,localStorage)
+- ✅ 分階段錯誤處理與單階段重試(不整條重跑)
+- ✅ Gemini 失敗/額度用完仍能出片(deterministic fallback 候選)
+- ✅ ESLint 設定(原本缺 .eslintrc.json,npm run lint 跑不起來)
+- ✅ segmenter / candidates 單元測試(npm test,25 個)
 
 ## 還沒做的
 
@@ -155,8 +169,12 @@ C:\50cut\
         ├── ratelimit.ts               ← 記憶體版
         ├── logger.ts                  ← redact 敏感欄位
         ├── constants.ts               ← LIMITS(5 分/300MB)
-        ├── types.ts                   ← 共用 types
-        └── utils.ts                   ← cn/formatBytes/formatDuration
+        ├── types.ts                   ← 共用 types(TranscriptWord/SubtitleCue)
+        ├── subtitle-segmenter.ts      ← ★ deterministic 字幕切分(有測試)
+        ├── highlight-candidates.ts    ← ★ 候選片段產生(有測試)
+        ├── pipeline.ts                ← 一鍵流程協調層(分階段、可單階段重試)
+        ├── dictionary.ts              ← 個人字典(localStorage,自動學習)
+        └── utils.ts                   ← cn/formatBytes/formatTimecode/formatCueTime
 ```
 
 ---
@@ -249,3 +267,55 @@ UNLIMITED_EMAILS=cheer@cheerdigiart.com.tw
 ---
 
 **最後**:別破壞使用者當初的決策,尤其**「影片留本機」**這個核心敘事。要改前先問。
+
+
+---
+
+## 時間軸鐵律(改字幕相關功能前必讀)
+
+```text
+ASR / word timestamp  = 真實語音時間      ← 唯一時間來源
+subtitleSegmenter     = deterministic 切分 ← 決定字幕邊界
+Gemini                = 語意理解、校字、選片 ← 只做判斷
+ffmpeg                = deterministic 執行
+```
+
+**AI 不可以同時控制**:文字、timestamp、字幕切分、影片實際剪輯時間。
+
+具體約束:
+- `SubtitleCue.start/end` 一律複製自 `TranscriptWord.start/end`,不得內插或由 LLM 產生
+- `/api/proofread` 只接受 `{index, from, to}` patch,server 端會驗證 `from` 逐字存在才套用
+- `/api/highlight` 的時間一律取自系統產生的候選物件,Gemini 回的任何數字都不當時間用
+- 拿不到 word timestamp 時走 `subdivideSegments()`,標記 `timing: 'estimated'`、`words: []`,
+  **不假造**每個字的時間;UI 必須顯示「約」與「時間為估算」
+
+切分參數(要調就改這裡,不要改演算法):
+`src/lib/subtitle-segmenter.ts` → `DEFAULT_SEGMENTER_CONFIG`
+```ts
+maxChars    = 14    // 一段字幕最多幾字
+maxDuration = 3.5   // 一段最長幾秒
+minDuration = 0.7   // 一段最短幾秒(句界優先於此值)
+pauseSplit  = 0.45  // 停頓超過幾秒就切
+```
+
+候選片段參數:`src/lib/highlight-candidates.ts` → `DEFAULT_CANDIDATE_CONFIG`
+
+## 驗證指令(改完一定要跑)
+
+```bash
+npm run typecheck
+npm run lint
+npm test          # 需要 tsx devDependency,先 npm install
+npm run build
+```
+
+## 已知技術限制
+
+1. **Groq 中文 word timestamp 的實際粒度未實測** — 程式對「單字」與「短詞」都能運作,
+   但真實表現要看 log 的 `timing_source` 與字幕結果,不理想就調 segmenter 常數
+2. **Whisper 幻聽** — 上游辨識品質問題,segmenter 修不了聽錯的字;
+   防線是個人字典 + 手動編輯
+3. **`-ss` 放在 `-i` 前是快速 seek** — 實際切點會吸附最近關鍵幀,可能與 cue 邊界差幾十毫秒。
+   要精準需改 output seeking(慢很多),尚未改
+4. **每支影片打 Gemini 兩次**(proofread + ranking),免費額度燒得快;
+   proofread 失敗會靜默跳過不擋流程

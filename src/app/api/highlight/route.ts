@@ -1,81 +1,102 @@
+/**
+ * 選片 API。
+ *
+ * 流程:
+ *   client 傳完整字幕 timeline
+ *     → 這裡用 deterministic 規則產生候選片段(邊界一律對齊 cue)
+ *     → Gemini 只回 selectedCandidateId + 標題 + 理由 + 評分
+ *     → 時間一律取自候選,Gemini 回的任何數字都不會被當成時間使用
+ *
+ * 也就是說 AI 只做「判斷」,不做「計時」。
+ */
+
 import { NextResponse, type NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { checkRateLimit, getClientIp } from '@/lib/ratelimit';
 import { log } from '@/lib/logger';
+import {
+  buildCandidates,
+  pickDefaultCandidate,
+  DEFAULT_CANDIDATE_CONFIG,
+} from '@/lib/highlight-candidates';
 import type {
   ApiError,
+  HighlightCandidate,
   HighlightResponse,
-  TranscriptSegment,
+  HighlightScores,
+  SubtitleCue,
 } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const maxDuration = 30;
 
-const MAX_SEGMENTS = 500;
-const MIN_HL = 25;   // 亮點最短 25 秒
-const MAX_HL = 65;   // 亮點最長 65 秒
+const MAX_CUES = 800;
+const MAX_CUE_CHARS = 300;
 
 type ClientPayload = {
   duration: number;
-  segments: TranscriptSegment[];
+  cues: Pick<SubtitleCue, 'start' | 'end' | 'text'>[];
 };
 
-const HIGHLIGHT_SCHEMA = {
+const RANKING_SCHEMA = {
   type: 'object',
   properties: {
-    highlight: {
+    selectedCandidateId: {
+      type: 'string',
+      description: '從候選清單挑一個 id,例如 candidate_2。只能是清單裡出現過的 id',
+    },
+    title: { type: 'string', description: '適合 Threads 的短標題,15 字內' },
+    reason: { type: 'string', description: '為什麼選這段(一句話)' },
+    scores: {
       type: 'object',
       properties: {
-        start: { type: 'number', description: '亮點起始秒數' },
-        end: { type: 'number', description: '亮點結束秒數' },
-        reason: { type: 'string', description: '為什麼選這段(一句話)' },
+        hook: { type: 'integer', description: '開頭吸引力 1-10' },
+        completeness: { type: 'integer', description: '語意完整度 1-10' },
+        emotion: { type: 'integer', description: '情緒強度 1-10' },
+        shareability: { type: 'integer', description: '分享意願 1-10' },
       },
-      required: ['start', 'end', 'reason'],
-    },
-    title: {
-      type: 'string',
-      description: '適合 Threads 的短標題,15 字內',
+      required: ['hook', 'completeness', 'emotion', 'shareability'],
     },
     hashtags: {
       type: 'array',
       items: { type: 'string' },
-      description: '3–5 個繁中或英文 hashtag,不含 # 符號',
+      description: '3-5 個 hashtag,不含 # 符號',
     },
   },
-  required: ['highlight', 'title', 'hashtags'],
+  required: ['selectedCandidateId', 'title', 'reason', 'scores'],
 };
 
-function buildPrompt(payload: ClientPayload): string {
-  const lines = payload.segments
-    .map((s) => `[${s.start.toFixed(1)}-${s.end.toFixed(1)}] ${s.text}`)
-    .join('\n');
+function buildPrompt(candidates: HighlightCandidate[], duration: number): string {
+  const list = candidates
+    .map(
+      (c) =>
+        `${c.id} | ${c.start.toFixed(2)}s-${c.end.toFixed(2)}s | ${c.duration.toFixed(1)} 秒\n${c.text}`
+    )
+    .join('\n\n');
 
-  // 短影片直接整支當亮點
-  const isShort = payload.duration < MIN_HL;
-  const lengthRule = isShort
-    ? `- 影片太短(${payload.duration.toFixed(1)} 秒),直接把整支影片當亮點:start=0, end=${payload.duration.toFixed(1)}`
-    : `- 長度 ${MIN_HL}-${MAX_HL} 秒之間
-- 有起頭、有結論,能獨立看懂
-- 有記憶點:金句、衝突、笑點、情緒高點、意外資訊
-- 避免半句被切斷,start/end 對齊字幕邊界
-- 若整支影片都很平,選最完整的一段觀點`;
+  return `你是幫繁中創作者挑短影音片段的編輯。這支影片全長 ${duration.toFixed(1)} 秒。
 
-  return `你是一個幫繁中創作者剪短影音的助手。以下是一支長度 ${payload.duration.toFixed(1)} 秒的影片逐字稿(帶時間戳)。
+下面是系統已經切好的候選片段（起訖都已對齊完整語句，你不需要也不可以自己算時間）。
+請挑出**最適合當短影音**的一個，並給標題與評分。
 
-請從中挑出**一段最適合當短影音的亮點**,規則:
-${lengthRule}
+判斷標準：
+- 開頭幾秒就要有 hook，能讓人停下來
+- 語意完整，不需要看前文也懂
+- 有記憶點：金句、衝突、笑點、情緒高點、意外資訊
+- 分享意願高
 
-輸出:
-- highlight: 起始/結束秒數 + 選段理由
-- title: Threads 風格短標題,15 字內,口語、有梗、能吸引點擊,不要「震驚體」
-- hashtags: 3-5 個,繁中或英文皆可,不含 # 符號
+輸出：
+- selectedCandidateId：只能填下面清單出現過的 id
+- title：Threads 風格短標題，15 字內，口語、有梗、不要震驚體
+- reason：一句話說明為什麼選它
+- scores：hook / completeness / emotion / shareability 各給 1-10
+- hashtags：3-5 個，不含 #
 
-逐字稿:
-${lines}`;
+候選片段：
+${list}`;
 }
 
 export async function POST(request: NextRequest) {
-  // Auth
   const supabase = createClient();
   const {
     data: { user },
@@ -87,22 +108,20 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Rate limit
   const ip = getClientIp(request);
   if (!checkRateLimit(`hl:ip:${ip}`).allowed) {
     return NextResponse.json<ApiError>(
-      { error: '太頻繁了,稍後再試', code: 'rate_limited' },
+      { error: '太頻繁了，稍後再試', code: 'rate_limited' },
       { status: 429 }
     );
   }
   if (!checkRateLimit(`hl:user:${user.id}`, 30).allowed) {
     return NextResponse.json<ApiError>(
-      { error: '太頻繁了,稍後再試', code: 'rate_limited' },
+      { error: '太頻繁了，稍後再試', code: 'rate_limited' },
       { status: 429 }
     );
   }
 
-  // Body
   let body: ClientPayload;
   try {
     body = (await request.json()) as ClientPayload;
@@ -115,44 +134,57 @@ export async function POST(request: NextRequest) {
   if (
     !body ||
     typeof body.duration !== 'number' ||
-    !Array.isArray(body.segments) ||
-    body.segments.length === 0
+    !Array.isArray(body.cues) ||
+    body.cues.length === 0
   ) {
     return NextResponse.json<ApiError>(
-      { error: '缺少字幕資料', code: 'no_segments' },
+      { error: '缺少字幕資料', code: 'no_cues' },
       { status: 400 }
     );
   }
-  if (body.segments.length > MAX_SEGMENTS) {
+  if (body.cues.length > MAX_CUES) {
     return NextResponse.json<ApiError>(
-      { error: '字幕過多', code: 'too_many_segments' },
+      { error: '字幕過多', code: 'too_many_cues' },
       { status: 400 }
     );
   }
 
-  // Sanitize segments(不信任來源,即使前端剛送)
-  const segments: TranscriptSegment[] = body.segments
+  // 不信任 client:清洗一次
+  const cues: SubtitleCue[] = body.cues
     .filter(
-      (s) =>
-        typeof s?.start === 'number' &&
-        typeof s?.end === 'number' &&
-        typeof s?.text === 'string' &&
-        s.end > s.start
+      (c) =>
+        typeof c?.start === 'number' &&
+        typeof c?.end === 'number' &&
+        typeof c?.text === 'string' &&
+        c.end > c.start
     )
-    .map((s) => ({
-      start: Math.max(0, s.start),
-      end: Math.min(body.duration, s.end),
-      text: s.text.slice(0, 300), // 每句上限 300 字防 prompt 攻擊
-    }));
+    .map((c) => ({
+      start: Math.max(0, c.start),
+      end: Math.min(body.duration, c.end),
+      text: c.text.slice(0, MAX_CUE_CHARS),
+      words: [],
+      timing: 'exact' as const,
+    }))
+    .sort((a, b) => a.start - b.start);
 
-  if (segments.length === 0) {
+  if (cues.length === 0) {
     return NextResponse.json<ApiError>(
-      { error: '字幕無效', code: 'invalid_segments' },
+      { error: '字幕無效', code: 'invalid_cues' },
       { status: 400 }
     );
   }
 
-  // Call Gemini
+  // ---- 候選片段:deterministic,與 AI 無關 ----
+  const candidates = buildCandidates(cues, DEFAULT_CANDIDATE_CONFIG);
+  if (candidates.length === 0) {
+    return NextResponse.json<ApiError>(
+      { error: '影片太短，做不出候選片段', code: 'no_candidates' },
+      { status: 422 }
+    );
+  }
+
+  const fallback = pickDefaultCandidate(candidates)!;
+
   const key = process.env.GEMINI_API_KEY;
   const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
   if (!key) {
@@ -164,118 +196,141 @@ export async function POST(request: NextRequest) {
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
-
   const geminiBody = {
     contents: [
-      {
-        role: 'user',
-        parts: [{ text: buildPrompt({ duration: body.duration, segments }) }],
-      },
+      { role: 'user', parts: [{ text: buildPrompt(candidates, body.duration) }] },
     ],
     generationConfig: {
       responseMimeType: 'application/json',
-      responseSchema: HIGHLIGHT_SCHEMA,
+      responseSchema: RANKING_SCHEMA,
       temperature: 0.4,
     },
   };
 
+  const MAX_ATTEMPTS = 3;
   let geminiJson: {
     candidates?: { content?: { parts?: { text?: string }[] } }[];
+  } = {};
+  let ok = false;
+  let lastStatus = 0;
+  let lastSnippet = '';
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(geminiBody),
+      });
+      if (resp.ok) {
+        geminiJson = await resp.json();
+        ok = true;
+        break;
+      }
+      lastStatus = resp.status;
+      lastSnippet = (await resp.text().catch(() => '')).slice(0, 300);
+      // 每日額度用完 → 重試沒有意義
+      const quotaExhausted =
+        resp.status === 429 && /exceeded your current quota|billing/i.test(lastSnippet);
+      const retryable = !quotaExhausted && (resp.status === 429 || resp.status >= 500);
+      if (!retryable || attempt === MAX_ATTEMPTS) break;
+      log.warn('gemini_retry', { attempt, status: resp.status });
+      await new Promise((r) => setTimeout(r, attempt * 1500));
+    } catch (err) {
+      lastSnippet = (err as Error).message ?? 'network_error';
+      if (attempt === MAX_ATTEMPTS) break;
+      log.warn('gemini_retry_network', { attempt });
+      await new Promise((r) => setTimeout(r, attempt * 1500));
+    }
+  }
+
+  if (!ok) {
+    const quotaExhausted =
+      lastStatus === 429 && /exceeded your current quota|billing/i.test(lastSnippet);
+    log.warn('gemini_ranking_unavailable', {
+      status: lastStatus,
+      quota: quotaExhausted,
+      snippet: lastSnippet.slice(0, 200),
+    });
+    // AI 排序失敗不代表做不出短片:用 deterministic 預設候選繼續
+    return NextResponse.json<HighlightResponse>({
+      highlight: {
+        start: fallback.start,
+        end: fallback.end,
+        reason: quotaExhausted
+          ? 'AI 額度用完，先用系統挑的完整片段'
+          : 'AI 暫時無法排序，先用系統挑的完整片段',
+      },
+      title: '',
+      hashtags: [],
+      candidateId: fallback.id,
+      candidates,
+    });
+  }
+
+  const rawText = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '';
+  let parsed: {
+    selectedCandidateId?: unknown;
+    title?: unknown;
+    reason?: unknown;
+    scores?: unknown;
+    hashtags?: unknown;
   };
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(geminiBody),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => '');
-      log.error('gemini_failed', {
-        status: resp.status,
-        snippet: errText.slice(0, 200),
-      });
-      return NextResponse.json<ApiError>(
-        { error: '選段失敗,再試一次', code: 'gemini_error' },
-        { status: 502 }
-      );
-    }
-    geminiJson = await resp.json();
-  } catch (err) {
-    log.error('gemini_network_error', { msg: (err as Error).message });
-    return NextResponse.json<ApiError>(
-      { error: '網路錯誤,再試一次', code: 'network_error' },
-      { status: 502 }
-    );
-  }
-
-  // Parse
-  const text =
-    geminiJson.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '';
-  let parsed: HighlightResponse;
-  try {
-    parsed = JSON.parse(text) as HighlightResponse;
+    parsed = JSON.parse(rawText);
   } catch {
-    log.warn('gemini_parse_fail', { snippet: text.slice(0, 200) });
-    return NextResponse.json<ApiError>(
-      { error: '選段回傳格式錯誤', code: 'parse_error' },
-      { status: 502 }
-    );
+    log.warn('gemini_parse_fail', { snippet: rawText.slice(0, 200) });
+    parsed = {};
   }
 
-  // Guard rails + clamp(Gemini 有時會回略超出的 end)
-  const hl = parsed.highlight;
-  if (!hl || typeof hl.start !== 'number' || typeof hl.end !== 'number') {
-    log.warn('highlight_shape_bad', { snippet: text.slice(0, 200) });
-    return NextResponse.json<ApiError>(
-      { error: '選段結果無效', code: 'invalid_highlight' },
-      { status: 502 }
-    );
-  }
-  // Clamp
-  hl.start = Math.max(0, hl.start);
-  hl.end = Math.min(body.duration, hl.end);
-  if (hl.end <= hl.start) {
-    log.warn('highlight_range_bad', {
-      start: hl.start,
-      end: hl.end,
-      duration: body.duration,
-    });
-    return NextResponse.json<ApiError>(
-      { error: '選段結果無效', code: 'invalid_range' },
-      { status: 502 }
-    );
-  }
-  const dur = hl.end - hl.start;
-  const minAllowed = body.duration < MIN_HL ? 1 : 10;
-  if (dur < minAllowed || dur > 90) {
-    log.warn('highlight_length_bad', { dur, duration: body.duration });
-    return NextResponse.json<ApiError>(
-      { error: '選段長度不合理', code: 'invalid_length' },
-      { status: 502 }
-    );
-  }
+  // 只接受清單裡真實存在的 id;其他一律退回 deterministic 選擇
+  const chosen =
+    (typeof parsed.selectedCandidateId === 'string'
+      ? candidates.find((c) => c.id === parsed.selectedCandidateId)
+      : undefined) ?? fallback;
 
-  const clean: HighlightResponse = {
+  const rawScores = (parsed.scores ?? {}) as Partial<Record<keyof HighlightScores, unknown>>;
+  const clampScore = (v: unknown): number =>
+    typeof v === 'number' && Number.isFinite(v)
+      ? Math.max(1, Math.min(10, Math.round(v)))
+      : 5;
+  const scores: HighlightScores = {
+    hook: clampScore(rawScores.hook),
+    completeness: clampScore(rawScores.completeness),
+    emotion: clampScore(rawScores.emotion),
+    shareability: clampScore(rawScores.shareability),
+  };
+
+  const response: HighlightResponse = {
+    // 時間只來自候選,絕不採用 Gemini 回的任何數字
     highlight: {
-      start: hl.start,
-      end: hl.end,
-      reason: String(hl.reason ?? '').slice(0, 100),
+      start: chosen.start,
+      end: chosen.end,
+      reason:
+        typeof parsed.reason === 'string' ? parsed.reason.slice(0, 120) : '完整且有記憶點的片段',
     },
-    title: String(parsed.title ?? '').slice(0, 40),
+    title: typeof parsed.title === 'string' ? parsed.title.slice(0, 40) : '',
     hashtags: Array.isArray(parsed.hashtags)
       ? parsed.hashtags
-          .filter((t) => typeof t === 'string')
+          .filter((t): t is string => typeof t === 'string')
           .slice(0, 8)
           .map((t) => t.replace(/^#/, '').slice(0, 20))
       : [],
+    scores,
+    candidateId: chosen.id,
+    candidates,
   };
 
   log.info('highlight_ok', {
     u: log.userHash(user.id),
-    dur: (clean.highlight.end - clean.highlight.start).toFixed(1),
+    cues: cues.length,
+    candidates: candidates.length,
+    chosen: chosen.id,
+    ai_chose: chosen.id === parsed.selectedCandidateId,
+    dur: chosen.duration.toFixed(2),
   });
 
-  return NextResponse.json(clean);
+  return NextResponse.json(response);
 }
 
 export async function GET() {

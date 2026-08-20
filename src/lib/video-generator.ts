@@ -8,9 +8,9 @@ import type { TranscriptSegment } from '@/lib/types';
 export type SubtitlePosition = 'high' | 'middle' | 'low';
 
 // Safe zone 對應到影片高度的百分比(距頂端)
-// high  = 65%(較上面,避開 Threads 底部按鈕多)
+// high  = 65%(較上面，避開 Threads 底部按鈕多)
 // middle = 75%
-// low   = 82%(較下面,適合影片下半沒重要畫面)
+// low   = 82%(較下面，適合影片下半沒重要畫面)
 const POSITION_MAP: Record<SubtitlePosition, number> = {
   high: 0.65,
   middle: 0.75,
@@ -49,7 +49,7 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
   await ffmpeg.writeFile('font.otf', fontBytes);
   await ffmpeg.writeFile(inputName, await fetchFile(file));
 
-  // 4. 準備字幕(挑落在 highlight 範圍內的 segments,時間校正到 0 起算)
+  // 4. 準備字幕(挑落在 highlight 範圍內的 segments，時間校正到 0 起算)
   const enc = new TextEncoder();
   const subs = segments
     .filter((s) => s.end > hlStart && s.start < hlEnd)
@@ -69,9 +69,9 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
   }
 
   // 5. 建 filter_complex
-  //    位置公式:y = h*percent - text_h/2(垂直置中對齊 percent 高度)
+  //    位置公式：y = h*percent - text_h/2(垂直置中對齊 percent 高度)
   const posPct = POSITION_MAP[position];
-  const fontSizeExpr = 'h/22'; // 相對字級,直式 1080 高會是 ~49px
+  const fontSizeExpr = 'h/22'; // 相對字級，直式 1080 高會是 ~49px
 
   const drawtexts = subs.map((s, i) => {
     const parts = [
@@ -84,7 +84,7 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
       `line_spacing=8`,
       `x=(w-text_w)/2`,
       `y=h*${posPct.toFixed(2)}-text_h/2`,
-      `enable='between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})'`,
+      `enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`,
     ];
     return `drawtext=${parts.join(':')}`;
   });
@@ -95,16 +95,16 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
 
   // 6. 進度事件
   const progHandler = ({ progress }: { progress: number }) => {
-    // ffmpeg 進度 0..1,映射到 20%..95%
+    // ffmpeg 進度 0..1，映射到 20%..95%
     const p = 0.2 + Math.min(1, Math.max(0, progress)) * 0.75;
     onProgress?.(p, '合成影片...');
   };
   ffmpeg.on('progress', progHandler);
 
   try {
-    // 7. 執行:先 seek 再 encode,加字幕 filter
+    // 7. 執行：先 seek 再 encode，加字幕 filter
     //    -ss 放輸入前是快速 seek(適合關鍵幀對齊)
-    //    保持原比例、原尺寸,不改解析度
+    //    保持原比例、原尺寸，不改解析度
     onProgress?.(0.2, '合成影片...');
     await ffmpeg.exec([
       '-ss', hlStart.toFixed(2),
@@ -131,7 +131,7 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
     }
 
     onProgress?.(1, '完成');
-    return new Blob([data], { type: 'video/mp4' });
+    return new Blob([data as BlobPart], { type: 'video/mp4' });
   } finally {
     ffmpeg.off('progress', progHandler);
   }
@@ -139,11 +139,11 @@ export async function generateShortVideo(opts: GenerateOptions): Promise<Blob> {
 
 /**
  * 中英混合字幕的簡易自動斷行。
- * 中文按字元寬度,英文按空格斷開,盡量在標點/空格處換行。
+ * 中文按字元寬度，英文按空格斷開，盡量在標點/空格處換行。
  */
 function wrapChinese(text: string, maxCharsPerLine: number): string {
   if (!text) return '';
-  // 若已經有換行,保留使用者原本斷法
+  // 若已經有換行，保留使用者原本斷法
   if (text.includes('\n')) return text;
 
   const softBreak = /[,、。;:!?…,;:!?\s]/;

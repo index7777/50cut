@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: '50cut｜影片界的 50 元快剪',
-  description: '手機錄完丟進來,兩分鐘給你 Threads 短片。連字幕都幫你上好。',
+  description: '手機錄完丟進來，兩分鐘給你 Threads 短片。連字幕都幫你上好。',
   manifest: '/manifest.webmanifest',
   appleWebApp: { capable: true, statusBarStyle: 'black-translucent', title: '50cut' },
 };

@@ -1,6 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // ffmpeg.wasm 內部用 new Worker(new URL(...)) 載入 worker,
+  // 這個設定讓 Next 14 (webpack 5) 正確處理它的 worker chunk,避免 404 卡 0%
+  transpilePackages: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
   // ffmpeg.wasm 需要以下 headers 才能用 SharedArrayBuffer
   async headers() {
     return [

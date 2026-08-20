@@ -1,205 +1,360 @@
 'use client';
 
-import { useRef, useState } from 'react';
-import { extractAudio, probeVideoDuration } from '@/lib/ffmpeg';
-import { generateShortVideo, type SubtitlePosition } from '@/lib/video-generator';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { probeVideoDuration } from '@/lib/ffmpeg';
+import { type SubtitlePosition } from '@/lib/video-generator';
+import { SubtitleEditor } from '@/components/subtitle-editor';
+import { ProcessingSteps } from '@/components/processing-steps';
 import { LIMITS } from '@/lib/constants';
-import { formatBytes, formatDuration, cn } from '@/lib/utils';
-import type { TranscribeResponse, HighlightResponse } from '@/lib/types';
+import { formatBytes, formatDuration, formatCueTime, cn } from '@/lib/utils';
+import {
+  initialStages,
+  emptyArtifacts,
+  runExtract,
+  runTranscribe,
+  runProofreadAndSegment,
+  runHighlight,
+  runRender,
+  StageError,
+  type PipelineArtifacts,
+  type StageId,
+  type StageState,
+} from '@/lib/pipeline';
+import {
+  loadDictionary,
+  saveDictionary,
+  applyDictionary,
+  extractDiff,
+  upsertEntry,
+  type DictEntry,
+} from '@/lib/dictionary';
+import type { HighlightCandidate, SubtitleCue } from '@/lib/types';
 
-type Stage =
-  | 'idle'
-  | 'validating'
-  | 'ready'
-  | 'extracting'
-  | 'transcribing'
-  | 'picking'
-  | 'reviewing'
-  | 'generating'
-  | 'done'
-  | 'error';
+/** 畫面只有三層:選檔 → 處理中 → 完成。編輯器是完成頁的第二層 */
+type Phase = 'upload' | 'processing' | 'result';
 
 export function VideoUploader() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [phase, setPhase] = useState<Phase>('upload');
   const [file, setFile] = useState<File | null>(null);
   const [duration, setDuration] = useState(0);
-  const [stage, setStage] = useState<Stage>('idle');
-  const [progress, setProgress] = useState(0);
-  const [progressLabel, setProgressLabel] = useState('');
-  const [transcript, setTranscript] = useState<TranscribeResponse | null>(null);
-  const [highlight, setHighlight] = useState<HighlightResponse | null>(null);
-  const [outputBlob, setOutputBlob] = useState<Blob | null>(null);
-  const [outputUrl, setOutputUrl] = useState<string>('');
-  const [errorMsg, setErrorMsg] = useState('');
   const [dragActive, setDragActive] = useState(false);
+  const [validating, setValidating] = useState(false);
+
+  const [stages, setStages] = useState<StageState[]>(initialStages());
+  const [artifacts, setArtifacts] = useState<PipelineArtifacts>(emptyArtifacts());
+  const [failedStage, setFailedStage] = useState<StageId | null>(null);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  const [outputUrl, setOutputUrl] = useState('');
   const [subtitlePos, setSubtitlePos] = useState<SubtitlePosition>('middle');
+  const [showEditor, setShowEditor] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [title, setTitle] = useState('');
+
+  const [dict, setDict] = useState<DictEntry[]>([]);
+  const [showDictModal, setShowDictModal] = useState(false);
+  const [learnedToast, setLearnedToast] = useState<DictEntry | null>(null);
+  const originalTextsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    setDict(loadDictionary());
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
+    };
+  }, [outputUrl]);
+
+  const patchStage = useCallback((id: StageId, patch: Partial<StageState>) => {
+    setStages((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+  }, []);
+
+  // 用 ref 讓 pipeline 拿到最新字典,避免 stale closure
+  const dictRef = useRef<DictEntry[]>([]);
+  useEffect(() => {
+    dictRef.current = dict;
+  }, [dict]);
+
+  const ctx = { onStage: patchStage, get dict() { return dictRef.current; } };
+
+  // ---------------------------------------------------------------- 選檔
 
   async function handleFile(picked: File) {
-    setStage('validating');
+    setValidating(true);
     setErrorMsg('');
-    setTranscript(null);
-    setHighlight(null);
-    setOutputBlob(null);
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     setOutputUrl('');
+    setArtifacts(emptyArtifacts());
+    setStages(initialStages());
+    setFailedStage(null);
+    setShowEditor(false);
+    setTitle('');
 
     if (!picked.type.startsWith('video/') && !/\.(mp4|mov|webm|mkv|m4v)$/i.test(picked.name)) {
-      setStage('error');
+      setValidating(false);
       setErrorMsg('請選影片檔');
       return;
     }
     if (picked.size > LIMITS.MAX_FILE_SIZE_BYTES) {
-      setStage('error');
+      setValidating(false);
       setErrorMsg(`檔案超過 ${formatBytes(LIMITS.MAX_FILE_SIZE_BYTES)}`);
       return;
     }
     try {
       const dur = await probeVideoDuration(picked);
       if (dur > LIMITS.MAX_DURATION_SECONDS) {
-        setStage('error');
+        setValidating(false);
         setErrorMsg(`影片超過 ${LIMITS.MAX_DURATION_SECONDS / 60} 分鐘`);
         return;
       }
       setDuration(dur);
       setFile(picked);
-      setStage('ready');
+      setValidating(false);
+      // 一鍵:選完檔直接跑,不用再按「開始處理」
+      void runAll(picked, dur);
     } catch {
-      setStage('error');
-      setErrorMsg('影片格式讀不到,換一支試試');
+      setValidating(false);
+      setErrorMsg('影片格式讀不到，換一支試試');
     }
   }
 
-  async function onFilePicked(e: React.ChangeEvent<HTMLInputElement>) {
-    const picked = e.target.files?.[0];
-    if (picked) await handleFile(picked);
-  }
+  // ---------------------------------------------------------------- 主流程
 
-  function onDragOver(e: React.DragEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!dragActive) setDragActive(true);
-  }
-  function onDragLeave(e: React.DragEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-  }
-  async function onDrop(e: React.DragEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    const picked = e.dataTransfer.files?.[0];
-    if (picked) await handleFile(picked);
-  }
-
-  async function onStart() {
-    if (!file) return;
-
-    // 1. 抽音訊
-    setStage('extracting');
-    setProgress(0);
+  async function runAll(target: File, dur: number) {
+    setPhase('processing');
     setErrorMsg('');
+    setFailedStage(null);
 
-    let audioBlob: Blob;
+    const acc: PipelineArtifacts = emptyArtifacts();
     try {
-      audioBlob = await extractAudio(file, (p) => setProgress(p));
-    } catch {
-      setStage('error');
-      setErrorMsg('抽音訊失敗,換一支試試');
-      return;
-    }
+      acc.audioBlob = await runExtract(target, ctx);
+      setArtifacts({ ...acc });
 
-    // 2. Whisper
-    setStage('transcribing');
-    let transcribeData: TranscribeResponse;
-    try {
-      const form = new FormData();
-      form.append('audio', audioBlob, 'audio.mp3');
-      const resp = await fetch('/api/transcribe', { method: 'POST', body: form });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: '辨識失敗' }));
-        setStage('error');
-        setErrorMsg(err.error ?? '辨識失敗');
-        return;
-      }
-      transcribeData = await resp.json();
-      setTranscript(transcribeData);
-    } catch {
-      setStage('error');
-      setErrorMsg('網路錯誤,再試一次');
-      return;
-    }
+      acc.transcript = await runTranscribe(acc.audioBlob, ctx);
+      setArtifacts({ ...acc });
 
-    // 3. Gemini 選亮點
-    setStage('picking');
-    try {
-      const resp = await fetch('/api/highlight', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          duration: transcribeData.duration,
-          segments: transcribeData.segments,
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: '選段失敗' }));
-        setStage('error');
-        setErrorMsg(err.error ?? '選段失敗');
-        return;
-      }
-      const hl: HighlightResponse = await resp.json();
-      setHighlight(hl);
-      setStage('reviewing');
-    } catch {
-      setStage('error');
-      setErrorMsg('網路錯誤,再試一次');
-    }
-  }
+      acc.cues = await runProofreadAndSegment(acc.transcript, ctx);
+      originalTextsRef.current = acc.cues.map((c) => c.text);
+      setArtifacts({ ...acc });
 
-  async function onGenerate() {
-    if (!file || !transcript || !highlight) return;
-    setStage('generating');
-    setProgress(0);
-    setProgressLabel('準備字型...');
-    setErrorMsg('');
+      acc.highlight = await runHighlight(
+        acc.cues,
+        acc.transcript.duration || dur,
+        ctx
+      );
+      setTitle(acc.highlight.title);
+      setArtifacts({ ...acc });
 
-    try {
-      const blob = await generateShortVideo({
-        file,
-        highlight: highlight.highlight,
-        segments: transcript.segments,
-        position: subtitlePos,
-        onProgress: (p, phase) => {
-          setProgress(p);
-          setProgressLabel(phase);
+      acc.outputBlob = await runRender(
+        {
+          file: target,
+          cues: acc.cues,
+          highlight: acc.highlight.highlight,
+          position: subtitlePos,
         },
-      });
-      const url = URL.createObjectURL(blob);
-      setOutputBlob(blob);
+        ctx
+      );
+      const url = URL.createObjectURL(acc.outputBlob);
       setOutputUrl(url);
-      setStage('done');
+      setArtifacts({ ...acc });
+      setPhase('result');
     } catch (err) {
-      setStage('error');
-      setErrorMsg(`合成失敗: ${(err as Error).message ?? '未知錯誤'}`);
+      const se = err as StageError;
+      setFailedStage(se.stage ?? null);
+      setErrorMsg(se.message ?? '處理失敗');
+      // 標記後續階段為未執行
+      setStages((prev) => {
+        const idx = prev.findIndex((s) => s.id === se.stage);
+        if (idx < 0) return prev;
+        return prev.map((s, i) => (i > idx && s.status === 'pending' ? s : s));
+      });
+    }
+  }
+
+  /** 只重跑失敗的那個階段,以及它之後的階段 */
+  async function retryFrom(stage: StageId) {
+    if (!file) return;
+    setErrorMsg('');
+    setFailedStage(null);
+    setPhase('processing');
+    patchStage(stage, { status: 'pending', message: undefined });
+
+    const acc: PipelineArtifacts = { ...artifacts };
+    try {
+      if (stage === 'extract' || !acc.audioBlob) {
+        acc.audioBlob = await runExtract(file, ctx);
+        setArtifacts({ ...acc });
+      }
+      if (
+        stage === 'extract' ||
+        stage === 'transcribe' ||
+        !acc.transcript
+      ) {
+        acc.transcript = await runTranscribe(acc.audioBlob!, ctx);
+        setArtifacts({ ...acc });
+      }
+      if (
+        stage === 'extract' ||
+        stage === 'transcribe' ||
+        stage === 'proofread' ||
+        acc.cues.length === 0
+      ) {
+        acc.cues = await runProofreadAndSegment(acc.transcript!, ctx);
+        originalTextsRef.current = acc.cues.map((c) => c.text);
+        setArtifacts({ ...acc });
+      }
+      if (stage !== 'subtitle' && stage !== 'render') {
+        acc.highlight = await runHighlight(
+          acc.cues,
+          acc.transcript!.duration || duration,
+          ctx
+        );
+        setTitle(acc.highlight.title);
+        setArtifacts({ ...acc });
+      }
+      acc.outputBlob = await runRender(
+        {
+          file,
+          cues: acc.cues,
+          highlight: acc.highlight!.highlight,
+          position: subtitlePos,
+        },
+        ctx
+      );
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
+      setOutputUrl(URL.createObjectURL(acc.outputBlob));
+      setArtifacts({ ...acc });
+      setPhase('result');
+    } catch (err) {
+      const se = err as StageError;
+      setFailedStage(se.stage ?? null);
+      setErrorMsg(se.message ?? '處理失敗');
+    }
+  }
+
+  /** 不靠 AI:自己框範圍。字幕已經在手上,直接進編輯器 */
+  function manualPick() {
+    if (!artifacts.transcript || artifacts.cues.length === 0) return;
+    const cues = artifacts.cues;
+    const dur = artifacts.transcript.duration || duration;
+    // 從第一句開始,湊到接近 40 秒為止,結尾一律落在 cue 邊界
+    let end = cues[0].end;
+    for (const c of cues) {
+      if (c.end - cues[0].start > 40) break;
+      end = c.end;
+    }
+    setArtifacts((prev) => ({
+      ...prev,
+      highlight: {
+        highlight: {
+          start: cues[0].start,
+          end: Math.min(dur, end),
+          reason: '手動選取範圍',
+        },
+        title: '',
+        hashtags: [],
+        candidateId: null,
+        candidates: prev.highlight?.candidates ?? [],
+      },
+    }));
+    patchStage('highlight', { status: 'skipped', message: '手動選取' });
+    setFailedStage(null);
+    setErrorMsg('');
+    setPhase('result');
+    setShowEditor(true);
+  }
+
+  /** 換一個候選片段 */
+  function chooseCandidate(c: HighlightCandidate) {
+    setArtifacts((prev) =>
+      prev.highlight
+        ? {
+            ...prev,
+            highlight: {
+              ...prev.highlight,
+              highlight: { ...prev.highlight.highlight, start: c.start, end: c.end },
+              candidateId: c.id,
+            },
+          }
+        : prev
+    );
+  }
+
+  async function rerender() {
+    if (!file || !artifacts.highlight) return;
+    setPhase('processing');
+    patchStage('subtitle', { status: 'pending' });
+    patchStage('render', { status: 'pending' });
+    setErrorMsg('');
+    setFailedStage(null);
+    try {
+      const blob = await runRender(
+        {
+          file,
+          cues: artifacts.cues,
+          highlight: artifacts.highlight.highlight,
+          position: subtitlePos,
+        },
+        ctx
+      );
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
+      setOutputUrl(URL.createObjectURL(blob));
+      setArtifacts((prev) => ({ ...prev, outputBlob: blob }));
+      setPhase('result');
+    } catch (err) {
+      const se = err as StageError;
+      setFailedStage(se.stage ?? 'render');
+      setErrorMsg(se.message ?? '合成失敗');
     }
   }
 
   function reset() {
+    setPhase('upload');
     setFile(null);
     setDuration(0);
-    setTranscript(null);
-    setHighlight(null);
-    setOutputBlob(null);
+    setStages(initialStages());
+    setArtifacts(emptyArtifacts());
+    setFailedStage(null);
+    setErrorMsg('');
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     setOutputUrl('');
-    setStage('idle');
-    setProgress(0);
-    setProgressLabel('');
-    setErrorMsg('');
+    setShowEditor(false);
+    setTitle('');
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
-  const showPicker = stage === 'idle' || stage === 'validating' || stage === 'error';
+  // ---------------------------------------------------------------- 字典自動學習
+
+  function commitCueEdit(index: number) {
+    const original = originalTextsRef.current[index];
+    const edited = artifacts.cues[index]?.text ?? '';
+    if (!original) return;
+    const diff = extractDiff(original, edited);
+    if (!diff) return;
+    const already = dict.find((e) => e.wrong === diff.wrong && e.right === diff.right);
+    const next = upsertEntry(dict, diff);
+    setDict(next);
+    saveDictionary(next);
+    if (!already) {
+      setLearnedToast(diff);
+      setTimeout(() => setLearnedToast(null), 3000);
+    }
+  }
+
+  function setCues(next: SubtitleCue[]) {
+    setArtifacts((prev) => ({ ...prev, cues: next }));
+  }
+
+  // ---------------------------------------------------------------- render
+
+  const hl = artifacts.highlight;
+  const cues = artifacts.cues;
+  const estimatedTiming = cues.length > 0 && cues.some((c) => c.timing === 'estimated');
+  // 字幕做完了嗎(用來區分「字幕失敗」與「只有選片失敗」)
+  const subtitlesReady = cues.length > 0;
 
   return (
     <div className="w-full">
@@ -207,17 +362,67 @@ export function VideoUploader() {
         ref={fileInputRef}
         type="file"
         accept="video/*"
-        onChange={onFilePicked}
+        onChange={(e) => {
+          const picked = e.target.files?.[0];
+          if (picked) void handleFile(picked);
+        }}
         className="hidden"
       />
 
-      {showPicker ? (
+      <div className="flex justify-end mb-3">
+        <button
+          onClick={() => setShowDictModal(true)}
+          className="text-[11px] uppercase tracking-wider opacity-50 hover:opacity-100 transition"
+        >
+          字典{dict.length > 0 && <span className="opacity-70"> · {dict.length}</span>}
+        </button>
+      </div>
+
+      {showDictModal && (
+        <DictionaryModal
+          entries={dict}
+          onClose={() => setShowDictModal(false)}
+          onSave={(next) => {
+            saveDictionary(next);
+            setDict(next);
+          }}
+        />
+      )}
+
+      {learnedToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-white text-black text-[13px] px-4 py-2 rounded-full shadow-2xl">
+          已記住:<span className="opacity-60">「{learnedToast.wrong}」</span>
+          <span className="opacity-40 mx-1.5">→</span>
+          <span>「{learnedToast.right}」</span>
+        </div>
+      )}
+
+      {/* ---------------- 選檔 ---------------- */}
+      {phase === 'upload' && (
         <div
-          onDragOver={onDragOver}
-          onDragEnter={onDragOver}
-          onDragLeave={onDragLeave}
-          onDrop={onDrop}
-          onClick={() => stage !== 'validating' && fileInputRef.current?.click()}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!dragActive) setDragActive(true);
+          }}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragActive(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragActive(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setDragActive(false);
+            const picked = e.dataTransfer.files?.[0];
+            if (picked) void handleFile(picked);
+          }}
+          onClick={() => !validating && fileInputRef.current?.click()}
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
@@ -228,214 +433,330 @@ export function VideoUploader() {
             dragActive
               ? 'border-white/60 bg-white/10 scale-[1.01]'
               : 'border-white/20 hover:border-white/40 hover:bg-white/5',
-            stage === 'validating' && 'opacity-50 pointer-events-none'
+            validating && 'opacity-50 pointer-events-none'
           )}
         >
-          <div className="text-4xl mb-2">{dragActive ? '📥' : '📹'}</div>
-          <p className="font-medium">
-            {stage === 'validating' ? '檢查中...' : dragActive ? '放開就好' : '選一支影片'}
+          <p className="text-xl font-light tracking-wide mb-2">
+            {validating ? '檢查中' : dragActive ? '放開就好' : '選一支影片'}
           </p>
-          <p className="text-xs opacity-40 mt-2">
-            <span className="hidden sm:inline">拖進來 或 </span>
+          <p className="text-xs opacity-40 tracking-wide">
+            <span className="hidden sm:inline">拖進來 · </span>
             點一下選檔
           </p>
-          <p className="text-xs opacity-30 mt-1">
-            最長 {LIMITS.MAX_DURATION_SECONDS / 60} 分鐘 · 最大 {formatBytes(LIMITS.MAX_FILE_SIZE_BYTES)}
+          <p className="text-[11px] opacity-30 mt-4 tracking-wider tabular-nums">
+            最長 {LIMITS.MAX_DURATION_SECONDS / 60} 分鐘 · 最大{' '}
+            {formatBytes(LIMITS.MAX_FILE_SIZE_BYTES)}
           </p>
         </div>
-      ) : null}
+      )}
 
-      {file && !showPicker ? (
+      {/* ---------------- 處理中 ---------------- */}
+      {phase === 'processing' && (
         <div className="rounded-2xl bg-white/5 border border-white/10 p-5">
-          <div className="flex items-start justify-between gap-3 mb-4">
-            <div className="min-w-0 flex-1">
-              <p className="font-medium truncate">{file.name}</p>
-              <p className="text-xs opacity-50 mt-1">
-                {formatDuration(duration)} · {formatBytes(file.size)}
-              </p>
+          {file && (
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div className="min-w-0 flex-1">
+                <p className="font-medium truncate">{file.name}</p>
+                <p className="text-xs opacity-50 mt-1 tabular-nums">
+                  {formatDuration(duration)} · {formatBytes(file.size)}
+                </p>
+              </div>
+              <button
+                onClick={reset}
+                className="text-xs opacity-50 hover:opacity-100 shrink-0"
+              >
+                換一支
+              </button>
             </div>
-            <button onClick={reset} className="text-xs opacity-50 hover:opacity-100 shrink-0">
-              換一支
+          )}
+
+          <ProcessingSteps stages={stages} />
+
+          {/* 分階段錯誤處理 */}
+          {failedStage && (
+            <div className="mt-4">
+              {failedStage === 'highlight' && subtitlesReady ? (
+                <div className="rounded-xl bg-white/[0.04] border border-white/10 p-4">
+                  <p className="text-sm mb-1">
+                    字幕已完成 <span className="text-emerald-400">✓</span>
+                  </p>
+                  <p className="text-xs opacity-60 mb-1">精彩片段目前無法產生</p>
+                  {errorMsg && (
+                    <p className="text-[11px] opacity-40 mb-3">{errorMsg}</p>
+                  )}
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={() => void retryFrom('highlight')}
+                      className="w-full py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-sm font-medium transition"
+                    >
+                      重新選片段
+                    </button>
+                    <button
+                      onClick={manualPick}
+                      className="w-full py-2.5 rounded-xl bg-white text-black text-sm font-medium hover:opacity-90 transition"
+                    >
+                      自己選片段
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-xl bg-red-500/[0.07] border border-red-500/25 p-4">
+                  <p className="text-sm text-red-200 mb-1">
+                    {stages.find((s) => s.id === failedStage)?.label}失敗
+                  </p>
+                  {errorMsg && <p className="text-xs opacity-70 mb-3">{errorMsg}</p>}
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => void retryFrom(failedStage)}
+                      className="flex-1 py-2.5 rounded-xl bg-white text-black text-sm font-medium hover:opacity-90 transition"
+                    >
+                      重試這個步驟
+                    </button>
+                    <button
+                      onClick={reset}
+                      className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-sm transition"
+                    >
+                      換一支
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------------- 完成 ---------------- */}
+      {phase === 'result' && hl && (
+        <div className="rounded-2xl bg-white/5 border border-white/10 p-5">
+          <div className="flex items-center justify-between gap-3 mb-4">
+            <p className="text-[11px] uppercase tracking-widest opacity-50">
+              {artifacts.outputBlob ? '短片好了' : '待合成'}
+            </p>
+            <button onClick={reset} className="text-xs opacity-50 hover:opacity-100">
+              再剪一支
             </button>
           </div>
 
-          {stage === 'ready' && (
-            <button
-              onClick={onStart}
-              className="w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 transition"
+          {outputUrl && (
+            <video
+              src={outputUrl}
+              controls
+              playsInline
+              className="w-full rounded-xl bg-black mb-4 max-h-[50vh]"
+            />
+          )}
+
+          {/* 主 CTA */}
+          {outputUrl && artifacts.outputBlob && (
+            <a
+              href={outputUrl}
+              download={buildDownloadName(title)}
+              className="block w-full py-3.5 rounded-xl bg-white text-black font-medium hover:opacity-90 transition text-center tracking-wide mb-3"
             >
-              開始處理
-            </button>
+              下載影片 ({formatBytes(artifacts.outputBlob.size)})
+            </a>
           )}
 
-          {stage === 'extracting' && (
-            <ProgressBlock label={`抽取音訊... ${(progress * 100).toFixed(0)}%`} progress={progress} />
-          )}
-          {stage === 'transcribing' && (
-            <ProgressBlock label="AI 辨識中..." progress={0} indeterminate />
-          )}
-          {stage === 'picking' && (
-            <ProgressBlock label="AI 挑亮點中..." progress={0} indeterminate />
-          )}
-
-          {(stage === 'reviewing' || stage === 'generating' || stage === 'done') &&
-            highlight &&
-            transcript && (
-              <div>
-                <p className="text-sm opacity-70 mb-3">
-                  {stage === 'done' ? '✅ 短片好了' : '✅ 找到亮點'}
-                </p>
-
-                <div className="rounded-xl bg-black/30 border border-white/10 p-4 mb-4">
-                  <p className="text-xs opacity-40 mb-2">建議標題</p>
-                  <p className="text-lg font-medium mb-3">{highlight.title}</p>
-
-                  <p className="text-xs opacity-40 mb-1">時間段</p>
-                  <p className="text-sm mb-3 tabular-nums">
-                    {formatDuration(highlight.highlight.start)} –{' '}
-                    {formatDuration(highlight.highlight.end)}
-                    <span className="opacity-40 ml-2">
-                      (約 {(highlight.highlight.end - highlight.highlight.start).toFixed(0)} 秒)
-                    </span>
-                  </p>
-
-                  <p className="text-xs opacity-40 mb-1">為什麼選這段</p>
-                  <p className="text-sm mb-3 opacity-80">{highlight.highlight.reason}</p>
-
-                  {highlight.hashtags.length > 0 && (
-                    <>
-                      <p className="text-xs opacity-40 mb-1">建議 hashtag</p>
-                      <div className="flex flex-wrap gap-2">
-                        {highlight.hashtags.map((t) => (
-                          <span key={t} className="text-xs px-2 py-1 rounded-full bg-white/10">
-                            #{t}
-                          </span>
-                        ))}
-                      </div>
-                    </>
-                  )}
-                </div>
-
-                {/* 字幕清單:高亮落在亮點內的段落 */}
-                <div className="rounded-xl bg-black/30 border border-white/10 p-3 max-h-48 overflow-y-auto text-sm leading-relaxed mb-4">
-                  {transcript.segments.map((s, i) => {
-                    const inHL =
-                      s.start >= highlight.highlight.start - 0.5 &&
-                      s.end <= highlight.highlight.end + 0.5;
-                    return (
-                      <div key={i} className={cn('flex gap-2 mb-2', inHL ? '' : 'opacity-30')}>
-                        <span className="text-xs shrink-0 mt-0.5 tabular-nums opacity-60">
-                          {formatDuration(s.start)}
-                        </span>
-                        <span>{s.text}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* 字幕位置選擇 */}
-                {stage === 'reviewing' && (
-                  <div className="mb-4">
-                    <p className="text-xs opacity-40 mb-2">字幕位置</p>
-                    <div className="grid grid-cols-3 gap-2">
-                      {(['high', 'middle', 'low'] as SubtitlePosition[]).map((p) => (
-                        <button
-                          key={p}
-                          onClick={() => setSubtitlePos(p)}
-                          className={cn(
-                            'py-2 rounded-xl text-sm border transition',
-                            subtitlePos === p
-                              ? 'bg-white text-black border-white'
-                              : 'bg-white/5 border-white/10 hover:bg-white/10'
-                          )}
-                        >
-                          {p === 'high' ? '偏上' : p === 'middle' ? '中間' : '偏下'}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {stage === 'reviewing' && (
-                  <button
-                    onClick={onGenerate}
-                    className="w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 transition"
-                  >
-                    合成短片
-                  </button>
-                )}
-
-                {stage === 'generating' && (
-                  <ProgressBlock label={`${progressLabel} ${(progress * 100).toFixed(0)}%`} progress={progress} />
-                )}
-
-                {stage === 'done' && outputUrl && outputBlob && (
-                  <div>
-                    <video
-                      src={outputUrl}
-                      controls
-                      playsInline
-                      className="w-full rounded-xl bg-black mb-4 max-h-96"
-                    />
-                    <a
-                      href={outputUrl}
-                      download={buildDownloadName(highlight.title)}
-                      className="block w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 transition text-center"
-                    >
-                      下載短片 ({formatBytes(outputBlob.size)})
-                    </a>
-                    <button
-                      onClick={reset}
-                      className="mt-3 w-full py-2 text-sm opacity-50 hover:opacity-100 transition"
-                    >
-                      再剪一支
-                    </button>
-                  </div>
-                )}
-              </div>
+          {/* 摘要 */}
+          <div className="rounded-xl bg-black/30 border border-white/10 p-4 mb-3">
+            <p className="text-[11px] uppercase tracking-widest opacity-40 mb-2">
+              建議標題 · 點一下改
+            </p>
+            {editingTitle ? (
+              <input
+                autoFocus
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                onBlur={() => setEditingTitle(false)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === 'Escape') setEditingTitle(false);
+                }}
+                maxLength={40}
+                className="w-full text-lg font-medium mb-3 bg-white/10 rounded px-2 py-1 outline-none focus:bg-white/15"
+              />
+            ) : (
+              <p
+                onClick={() => setEditingTitle(true)}
+                className="text-lg font-medium mb-3 rounded px-2 py-1 -mx-2 cursor-text hover:bg-white/5"
+              >
+                {title || <span className="opacity-30">(沒有標題，點我輸入)</span>}
+              </p>
             )}
-        </div>
-      ) : null}
 
-      {errorMsg && <p className="mt-4 text-sm text-red-400 text-center">{errorMsg}</p>}
-
-      {stage === 'error' && transcript && (
-        <div className="mt-4 rounded-xl bg-black/30 border border-white/10 p-3 max-h-48 overflow-y-auto text-sm leading-relaxed">
-          <p className="text-xs opacity-40 mb-2">已辨識的字幕({transcript.segments.length} 句)</p>
-          {transcript.segments.map((s, i) => (
-            <div key={i} className="flex gap-2 mb-2">
-              <span className="opacity-40 text-xs shrink-0 mt-0.5 tabular-nums">
-                {formatDuration(s.start)}
+            <p className="text-[11px] uppercase tracking-widest opacity-40 mb-1">片段</p>
+            <p className="text-sm mb-3 tabular-nums">
+              {formatCueTime(hl.highlight.start)} – {formatCueTime(hl.highlight.end)}
+              <span className="opacity-40 ml-2">
+                ({(hl.highlight.end - hl.highlight.start).toFixed(1)} 秒)
               </span>
-              <span>{s.text}</span>
+            </p>
+
+            <p className="text-[11px] uppercase tracking-widest opacity-40 mb-1">
+              為什麼選這段
+            </p>
+            <p className="text-sm mb-3 opacity-80">{hl.highlight.reason}</p>
+
+            {hl.scores && (
+              <>
+                <p className="text-[11px] uppercase tracking-widest opacity-40 mb-1">評分</p>
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] tabular-nums opacity-70 mb-3">
+                  <span>Hook {hl.scores.hook}</span>
+                  <span>完整 {hl.scores.completeness}</span>
+                  <span>情緒 {hl.scores.emotion}</span>
+                  <span>分享 {hl.scores.shareability}</span>
+                </div>
+              </>
+            )}
+
+            {hl.hashtags.length > 0 && (
+              <>
+                <p className="text-[11px] uppercase tracking-widest opacity-40 mb-1">
+                  建議 hashtag
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {hl.hashtags.map((t) => (
+                    <span key={t} className="text-xs px-2 py-1 rounded-full bg-white/10">
+                      #{t}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* 字幕摘要 */}
+          <div className="rounded-xl bg-black/30 border border-white/10 p-3 mb-3">
+            <p className="text-[11px] uppercase tracking-widest opacity-40 mb-2">
+              已辨識 {(artifacts.transcript?.duration || duration).toFixed(0)} 秒 ·{' '}
+              {cues.length} 段字幕
+              {estimatedTiming && (
+                <span className="ml-2 text-amber-300/80 normal-case tracking-normal">
+                  時間為估算
+                </span>
+              )}
+            </p>
+            <div className="max-h-40 overflow-y-auto text-sm leading-relaxed">
+              {cues.slice(0, 40).map((c, i) => {
+                const inHL =
+                  c.start >= hl.highlight.start - 0.01 && c.end <= hl.highlight.end + 0.01;
+                return (
+                  <div key={i} className={cn('mb-2', inHL ? '' : 'opacity-30')}>
+                    <div className="text-[11px] tabular-nums opacity-50">
+                      {c.timing === 'estimated' && <span className="mr-1">約</span>}
+                      {formatCueTime(c.start)} – {formatCueTime(c.end)}
+                    </div>
+                    <div>{c.text}</div>
+                  </div>
+                );
+              })}
+              {cues.length > 40 && (
+                <p className="text-[11px] opacity-30">…還有 {cues.length - 40} 段</p>
+              )}
             </div>
-          ))}
+          </div>
+
+          {/* 第二層:微調 */}
+          <button
+            onClick={() => setShowEditor((v) => !v)}
+            className="w-full py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-sm transition"
+          >
+            {showEditor ? '收起微調' : '微調字幕與片段'}
+          </button>
+
+          {showEditor && file && (
+            <div className="mt-4">
+              {estimatedTiming && (
+                <p className="text-[11px] text-amber-300/80 mb-2 leading-relaxed">
+                  這支影片拿不到逐字時間戳，字幕時間是依字數在段落內估算的，
+                  不是實際語音時間。建議對照波形手動校正。
+                </p>
+              )}
+
+              {hl.candidates.length > 1 && (
+                <div className="mb-3">
+                  <p className="text-[11px] uppercase tracking-widest opacity-40 mb-2">
+                    其他候選片段
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {hl.candidates.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => chooseCandidate(c)}
+                        className={cn(
+                          'px-2 py-1 rounded text-[11px] tabular-nums transition',
+                          hl.candidateId === c.id
+                            ? 'bg-white text-black'
+                            : 'bg-white/10 hover:bg-white/20'
+                        )}
+                      >
+                        {formatCueTime(c.start)} · {c.duration.toFixed(0)}s
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <SubtitleEditor
+                file={file}
+                audioBlob={artifacts.audioBlob}
+                duration={artifacts.transcript?.duration || duration}
+                cues={cues}
+                onCuesChange={setCues}
+                highlight={hl.highlight}
+                onHighlightChange={(next) =>
+                  setArtifacts((prev) =>
+                    prev.highlight
+                      ? {
+                          ...prev,
+                          highlight: {
+                            ...prev.highlight,
+                            highlight: { ...prev.highlight.highlight, ...next },
+                            candidateId: null,
+                          },
+                        }
+                      : prev
+                  )
+                }
+                onTextCommit={commitCueEdit}
+              />
+
+              <div className="mb-3">
+                <p className="text-[11px] uppercase tracking-widest opacity-40 mb-2">
+                  字幕位置
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['high', 'middle', 'low'] as SubtitlePosition[]).map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setSubtitlePos(p)}
+                      className={cn(
+                        'py-2 rounded-xl text-sm border transition',
+                        subtitlePos === p
+                          ? 'bg-white text-black border-white'
+                          : 'bg-white/5 border-white/10 hover:bg-white/10'
+                      )}
+                    >
+                      {p === 'high' ? '偏上' : p === 'middle' ? '中間' : '偏下'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                onClick={() => void rerender()}
+                className="w-full py-3 rounded-xl bg-white text-black font-medium hover:opacity-90 transition tracking-wide"
+              >
+                用這些設定重新合成
+              </button>
+            </div>
+          )}
         </div>
       )}
-    </div>
-  );
-}
 
-function ProgressBlock({
-  label,
-  progress,
-  indeterminate = false,
-}: {
-  label: string;
-  progress: number;
-  indeterminate?: boolean;
-}) {
-  return (
-    <div>
-      <div className="text-sm mb-2 opacity-70">{label}</div>
-      <div className="h-2 rounded-full bg-white/10 overflow-hidden">
-        {indeterminate ? (
-          <div className="h-full w-1/3 bg-white/60 animate-[slide_1.5s_ease-in-out_infinite]" />
-        ) : (
-          <div className="h-full bg-white transition-all" style={{ width: `${progress * 100}%` }} />
-        )}
-      </div>
-      <p className="text-xs opacity-40 mt-3">影片留在你的電腦/手機,只有聲音會上傳做辨識</p>
+      {errorMsg && phase === 'upload' && (
+        <p className="mt-4 text-sm text-red-400 text-center">{errorMsg}</p>
+      )}
     </div>
   );
 }
@@ -443,4 +764,79 @@ function ProgressBlock({
 function buildDownloadName(title: string): string {
   const safe = title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 40) || '50cut';
   return `${safe}.mp4`;
+}
+
+function DictionaryModal({
+  entries,
+  onClose,
+  onSave,
+}: {
+  entries: DictEntry[];
+  onClose: () => void;
+  onSave: (next: DictEntry[]) => void;
+}) {
+  const [rows, setRows] = useState<DictEntry[]>(entries);
+
+  function remove(i: number) {
+    const next = rows.filter((_, idx) => idx !== i);
+    setRows(next);
+    onSave(next);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="bg-neutral-900 border border-white/10 rounded-2xl p-5 w-full max-w-md max-h-[80vh] overflow-hidden flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-medium">已學到的字典</h3>
+          <button onClick={onClose} className="text-sm opacity-50 hover:opacity-100">
+            ✕
+          </button>
+        </div>
+        <p className="text-xs opacity-60 mb-3 leading-relaxed">
+          你每改一句字幕，系統會自動記下「原本認錯的字 → 你改成的字」，下次同樣的錯自動修好。
+          不用手動維護，越用越準。要移除某條點右邊 ✕ 就好。
+        </p>
+        <div className="overflow-y-auto flex-1 -mx-1 px-1">
+          {rows.length === 0 ? (
+            <p className="text-center opacity-40 py-8 text-sm">
+              還沒有學到任何對照。
+              <br />
+              改一次字幕就會自動加進來。
+            </p>
+          ) : (
+            rows.map((r, i) => (
+              <div key={i} className="flex gap-2 mb-2 items-center text-sm">
+                <span className="flex-1 bg-white/5 rounded px-2 py-1.5 opacity-60 truncate">
+                  {r.wrong}
+                </span>
+                <span className="opacity-40 shrink-0">→</span>
+                <span className="flex-1 bg-white/10 rounded px-2 py-1.5 truncate">
+                  {r.right}
+                </span>
+                <button
+                  onClick={() => remove(i)}
+                  className="opacity-40 hover:opacity-100 hover:text-red-400 shrink-0 px-1"
+                  title="移除"
+                >
+                  ✕
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+        <button
+          onClick={onClose}
+          className="w-full py-2 rounded-xl bg-white/5 hover:bg-white/10 text-sm mt-4"
+        >
+          關閉
+        </button>
+      </div>
+    </div>
+  );
 }
