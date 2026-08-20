@@ -359,6 +359,21 @@ export function SubtitleEditor({
     }
   }, [currentTime, pxPerSec, followPlayhead, playing]);
 
+  // 換候選 / 手動改 highlight 起點 → 時間軸捲到那裡、影片跳到那裡
+  useEffect(() => {
+    const sc = scrollRef.current;
+    if (!sc) return;
+    const x = highlight.start * pxPerSec;
+    programmaticScrollRef.current = true;
+    sc.scrollLeft = Math.max(0, x - sc.clientWidth * 0.15);
+    const v = videoRef.current;
+    if (v && !playing) {
+      v.currentTime = highlight.start;
+      setCurrentTime(highlight.start);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlight.start, highlight.end]);
+
   const seek = useCallback(
     (t: number) => {
       const clamped = Math.max(0, Math.min(duration, t));

@@ -70,13 +70,34 @@ export type ProofreadCorrection = {
   to: string;
 };
 
+export type AiStatus =
+  | { status: 'success' }
+  | { status: 'fallback'; reason: string }
+  | { status: 'skipped'; reason?: string };
+
 export type ProofreadResponse = {
   corrections: ProofreadCorrection[];
+  ai?: {
+    proofread: AiStatus;
+  };
 };
 
 // ---------------------------------------------------------------------------
 // Highlight:系統產生候選,AI 只做排序
 // ---------------------------------------------------------------------------
+
+export type CandidateScores = {
+  completeness: number;         // 0..1 頭尾語句完整度
+  hook: number;                 // 0..1 開頭吸引力
+  contextIndependence: number;  // 0..1 高=不依賴前文,低=承接詞/代詞開頭
+  speechDensity: number;        // 0..1 語音實際覆蓋率(vs 靜音)
+  boundaryQuality: number;      // 0..1 前後自然停頓
+  informationDensity: number;   // 0..1 unique tokens / total tokens
+  durationScore: number;        // 0..1 落在 target 區間(30-45s)= 1
+  introPenalty: number;         // 0..1 頻道開場詞 + 靠影片頭
+  outroPenalty: number;         // 0..1 收尾詞 + 靠影片尾
+  totalScore: number;           // 加權總分(可為負)
+};
 
 export type HighlightCandidate = {
   id: string;
@@ -89,6 +110,10 @@ export type HighlightCandidate = {
   cueStartIndex: number;
   cueEndIndex: number;
   text: string;
+  /** deterministic scoring 結果(build 時計算) */
+  scores?: CandidateScores;
+  /** 為什麼選這段(給 fallback UI 顯示) */
+  reasonText?: string;
 };
 
 export type HighlightScores = {
@@ -122,4 +147,7 @@ export type HighlightResponse = {
   candidateId: string | null;
   /** 候選清單,讓使用者可以換一個 */
   candidates: HighlightCandidate[];
+  ai?: {
+    ranking: AiStatus;
+  };
 };

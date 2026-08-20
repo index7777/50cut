@@ -6,6 +6,14 @@ export const metadata: Metadata = {
   description: '手機錄完丟進來，兩分鐘給你 Threads 短片。連字幕都幫你上好。',
   manifest: '/manifest.webmanifest',
   appleWebApp: { capable: true, statusBarStyle: 'black-translucent', title: '50cut' },
+  icons: {
+    icon: [
+      { url: '/favicon.ico', sizes: 'any' },
+      { url: '/icon-192.png', type: 'image/png', sizes: '192x192' },
+      { url: '/icon-512.png', type: 'image/png', sizes: '512x512' },
+    ],
+    apple: [{ url: '/icon-192.png', sizes: '192x192' }],
+  },
 };
 
 export const viewport: Viewport = {

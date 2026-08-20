@@ -109,13 +109,13 @@ describe('buildCandidates', () => {
 describe('pickDefaultCandidate', () => {
   it('沒有 AI 時也能 deterministic 選出一個', () => {
     const candidates = buildCandidates(makeCues(60), CFG);
-    const a = pickDefaultCandidate(candidates, CFG);
-    const b = pickDefaultCandidate(candidates, CFG);
+    const a = pickDefaultCandidate(candidates);
+    const b = pickDefaultCandidate(candidates);
     assert.ok(a);
     assert.equal(a!.id, b!.id, '同樣輸入必須得到同樣結果');
   });
 
   it('空清單回 null', () => {
-    assert.equal(pickDefaultCandidate([], CFG), null);
+    assert.equal(pickDefaultCandidate([]), null);
   });
 });

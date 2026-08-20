@@ -16,7 +16,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 60;   // Vercel 限制
 
 // 音訊上限：5 分鐘 16kHz mono 32kbps ≈ 1.2 MB。給到 5 MB 保險。
-const MAX_AUDIO_BYTES = 5 * 1024 * 1024;
+// 10 分鐘 32kbps mono MP3 ≈ 2.4MB;拉到 15MB 保險(Groq 上限 25MB)
+const MAX_AUDIO_BYTES = 15 * 1024 * 1024;
 
 export async function POST(request: NextRequest) {
   // 1. Auth
@@ -61,8 +62,20 @@ export async function POST(request: NextRequest) {
     return NextResponse.json<ApiError>({ error: '音訊過小或空白', code: 'audio_too_small' }, { status: 400 });
   }
 
-  // 4. 扣用量(無限白名單使用者跳過)
-  if (!isUnlimitedEmail(user.email)) {
+  // chunk 起始秒數(長片分段轉錄用)。合法範圍 0 - 24 小時。
+  const rawOffset = form.get('chunkStartSeconds');
+  const chunkStartSeconds = (() => {
+    if (typeof rawOffset !== 'string') return 0;
+    const n = Number(rawOffset);
+    if (!Number.isFinite(n) || n < 0 || n > 24 * 3600) return 0;
+    return n;
+  })();
+  // 是否為分段轉錄(多段共用同一次用量)
+  const isChunk = form.get('isChunk') === '1';
+
+  // 4. 扣用量(無限白名單、分段續接跳過;仍受速率限制保護)
+  //    分段長片:client 應在第一段(不帶 isChunk)扣一次,後續段落帶 isChunk=1 只跑辨識
+  if (!isUnlimitedEmail(user.email) && !isChunk) {
     const admin = createAdminClient();
     const { data: usage, error: usageErr } = await admin.rpc('consume_usage', {
       p_user_id: user.id,
@@ -79,7 +92,7 @@ export async function POST(request: NextRequest) {
         { status: 402 }
       );
     }
-  } else {
+  } else if (isUnlimitedEmail(user.email)) {
     log.info('unlimited_user', { u: log.userHash(user.id) });
   }
 
@@ -139,14 +152,15 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // 6. 回傳「最細粒度」的時間戳。
+  // 6. 回傳「最細粒度」的時間戳。分段時所有時間軸加 chunkStartSeconds 偏移。
   //    這裡不做任何斷句 —— 字幕切分交給 deterministic 的 subtitleSegmenter,
   //    這樣 AI 與 API 都不可能左右字幕邊界。
+  const offset = chunkStartSeconds;
   const segments = (whisperJson.segments ?? [])
     .filter((s) => typeof s.start === 'number' && typeof s.end === 'number')
     .map((s) => ({
-      start: s.start,
-      end: s.end,
+      start: s.start + offset,
+      end: s.end + offset,
       text: (s.text ?? '').trim(),
     }))
     .filter((s) => s.text.length > 0);
@@ -155,10 +169,12 @@ export async function POST(request: NextRequest) {
   const words: TranscriptWord[] = (whisperJson.words ?? [])
     .map((w) => {
       const raw = w as { start?: number; end?: number; word?: string; text?: string };
+      const s = typeof raw.start === 'number' ? raw.start + offset : Number.NaN;
+      const e = typeof raw.end === 'number' ? raw.end + offset : Number.NaN;
       return {
         text: (raw.word ?? raw.text ?? '').trim(),
-        start: raw.start ?? Number.NaN,
-        end: raw.end ?? Number.NaN,
+        start: s,
+        end: e,
       };
     })
     .filter(
@@ -174,7 +190,7 @@ export async function POST(request: NextRequest) {
 
   const payload: TranscribeResponse = {
     language: whisperJson.language ?? 'zh',
-    duration: whisperJson.duration ?? 0,
+    duration: (whisperJson.duration ?? 0),
     words,
     segments,
     timingSource,
@@ -188,6 +204,8 @@ export async function POST(request: NextRequest) {
     timing_source: timingSource,
     duration: payload.duration,
     full_text_len: payload.full_text.length,
+    offset,
+    is_chunk: isChunk,
   });
 
   return NextResponse.json(payload);

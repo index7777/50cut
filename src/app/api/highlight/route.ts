@@ -19,6 +19,8 @@ import {
   pickDefaultCandidate,
   DEFAULT_CANDIDATE_CONFIG,
 } from '@/lib/highlight-candidates';
+import { GEMINI_MODEL, geminiEndpoint } from '@/lib/ai-config';
+import { classifyGeminiError, reasonToUiText } from '@/lib/ai-errors';
 import type {
   ApiError,
   HighlightCandidate,
@@ -186,16 +188,25 @@ export async function POST(request: NextRequest) {
   const fallback = pickDefaultCandidate(candidates)!;
 
   const key = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const model = GEMINI_MODEL;
   if (!key) {
     log.error('missing_gemini_key');
-    return NextResponse.json<ApiError>(
-      { error: '伺服器未設定', code: 'server_misconfig' },
-      { status: 500 }
-    );
+    // 沒 key 不擋流程:回 deterministic fallback
+    return NextResponse.json<HighlightResponse>({
+      highlight: {
+        start: fallback.start,
+        end: fallback.end,
+        reason: fallback.reasonText ?? '已為你挑選一段完整片段',
+      },
+      title: '',
+      hashtags: [],
+      candidateId: fallback.id,
+      candidates,
+      ai: { ranking: { status: 'fallback', reason: 'missing_key' } },
+    });
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+  const url = geminiEndpoint(model, key);
   const geminiBody = {
     contents: [
       { role: 'user', parts: [{ text: buildPrompt(candidates, body.duration) }] },
@@ -214,6 +225,7 @@ export async function POST(request: NextRequest) {
   let ok = false;
   let lastStatus = 0;
   let lastSnippet = '';
+  let networkFailed = false;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -229,14 +241,15 @@ export async function POST(request: NextRequest) {
       }
       lastStatus = resp.status;
       lastSnippet = (await resp.text().catch(() => '')).slice(0, 300);
-      // 每日額度用完 → 重試沒有意義
-      const quotaExhausted =
-        resp.status === 429 && /exceeded your current quota|billing/i.test(lastSnippet);
-      const retryable = !quotaExhausted && (resp.status === 429 || resp.status >= 500);
+      // 400/404/429-quota:重試沒有意義
+      const reason = classifyGeminiError(resp.status, lastSnippet);
+      const retryable =
+        reason === 'rate_limit' || reason === 'provider_error' || reason === 'timeout';
       if (!retryable || attempt === MAX_ATTEMPTS) break;
-      log.warn('gemini_retry', { attempt, status: resp.status });
+      log.warn('gemini_retry', { attempt, status: resp.status, reason });
       await new Promise((r) => setTimeout(r, attempt * 1500));
     } catch (err) {
+      networkFailed = true;
       lastSnippet = (err as Error).message ?? 'network_error';
       if (attempt === MAX_ATTEMPTS) break;
       log.warn('gemini_retry_network', { attempt });
@@ -245,11 +258,12 @@ export async function POST(request: NextRequest) {
   }
 
   if (!ok) {
-    const quotaExhausted =
-      lastStatus === 429 && /exceeded your current quota|billing/i.test(lastSnippet);
+    const reason = networkFailed
+      ? 'network_error'
+      : classifyGeminiError(lastStatus, lastSnippet);
     log.warn('gemini_ranking_unavailable', {
       status: lastStatus,
-      quota: quotaExhausted,
+      reason,
       snippet: lastSnippet.slice(0, 200),
     });
     // AI 排序失敗不代表做不出短片:用 deterministic 預設候選繼續
@@ -257,14 +271,13 @@ export async function POST(request: NextRequest) {
       highlight: {
         start: fallback.start,
         end: fallback.end,
-        reason: quotaExhausted
-          ? 'AI 額度用完，先用系統挑的完整片段'
-          : 'AI 暫時無法排序，先用系統挑的完整片段',
+        reason: fallback.reasonText ?? '已為你挑選一段完整片段',
       },
       title: '',
       hashtags: [],
       candidateId: fallback.id,
       candidates,
+      ai: { ranking: { status: 'fallback', reason } },
     });
   }
 
@@ -319,6 +332,7 @@ export async function POST(request: NextRequest) {
     scores,
     candidateId: chosen.id,
     candidates,
+    ai: { ranking: { status: 'success' } },
   };
 
   log.info('highlight_ok', {

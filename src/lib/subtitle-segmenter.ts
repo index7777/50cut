@@ -24,10 +24,18 @@ export type SegmenterConfig = {
   pauseSplit: number;
 };
 
+/**
+ * 依規格調整:
+ *   TARGET_CHARS 10-16, HARD_MAX 20 → 這裡 maxChars 用 16(硬邊界由 +4 tolerance 撐到 20)
+ *   TARGET_DURATION 1.5-3.5, HARD_MAX 4.5 → maxDuration=3.5,tooShort 保底 1.0
+ *   PAUSE_SPLIT 0.45, STRONG 0.7 → 保留 pauseSplit=0.45,強停頓靠標點判斷
+ * 注意:字幕分段器只在「已被 normalizeWords 合併過的原子詞」之間切,
+ * 不應從一個原子詞中間切開(normalizer 保證每個 token.text 是完整詞)。
+ */
 export const DEFAULT_SEGMENTER_CONFIG: SegmenterConfig = {
-  maxChars: 14,
+  maxChars: 16,
   maxDuration: 3.5,
-  minDuration: 0.7,
+  minDuration: 1.0,
   pauseSplit: 0.45,
 };
 
@@ -116,8 +124,17 @@ export function segmentWords(
     // 純標點的 token 永遠黏在前一段,避免字幕開頭出現孤立標點
     const isPunctOnly = PUNCT_ONLY.test(w.text);
 
+    // 相鄰 ASCII token 且幾乎沒間隔 → Whisper 把一個英文詞切成子詞
+    // (例如 "Apple"→["App","le"]、"Podcasts"→["P","ock","ets"])
+    // 這時就算 maxChars 超了,也不要斷,否則會把英文單字切一半。
+    const prevLastChar = prev.text[prev.text.length - 1] ?? '';
+    const nextFirstChar = w.text[0] ?? '';
+    const isAsciiGlue =
+      ASCII_WORD.test(prevLastChar) && ASCII_WORD.test(nextFirstChar) && gap < 0.15;
+
     const shouldBreak =
       !isPunctOnly &&
+      !isAsciiGlue &&
       (gap >= config.pauseSplit ||
         currentChars + wordChars > config.maxChars ||
         spanIfAdded > config.maxDuration);

@@ -36,6 +36,14 @@ type Phase = 'upload' | 'processing' | 'result';
 export function VideoUploader() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ?debug=1 → 顯示 candidate scoring 明細
+  const [debugMode, setDebugMode] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const sp = new URLSearchParams(window.location.search);
+    setDebugMode(sp.get('debug') === '1');
+  }, []);
+
   const [phase, setPhase] = useState<Phase>('upload');
   const [file, setFile] = useState<File | null>(null);
   const [duration, setDuration] = useState(0);
@@ -133,7 +141,7 @@ export function VideoUploader() {
       acc.audioBlob = await runExtract(target, ctx);
       setArtifacts({ ...acc });
 
-      acc.transcript = await runTranscribe(acc.audioBlob, ctx);
+      acc.transcript = await runTranscribe(acc.audioBlob, ctx, dur);
       setArtifacts({ ...acc });
 
       acc.cues = await runProofreadAndSegment(acc.transcript, ctx);
@@ -193,7 +201,7 @@ export function VideoUploader() {
         stage === 'transcribe' ||
         !acc.transcript
       ) {
-        acc.transcript = await runTranscribe(acc.audioBlob!, ctx);
+        acc.transcript = await runTranscribe(acc.audioBlob!, ctx, duration);
         setArtifacts({ ...acc });
       }
       if (
@@ -267,7 +275,7 @@ export function VideoUploader() {
     setShowEditor(true);
   }
 
-  /** 換一個候選片段 */
+  /** 換一個候選片段:同步更新時間段 + 為什麼選這段 + editor 捲軸 */
   function chooseCandidate(c: HighlightCandidate) {
     setArtifacts((prev) =>
       prev.highlight
@@ -275,7 +283,13 @@ export function VideoUploader() {
             ...prev,
             highlight: {
               ...prev.highlight,
-              highlight: { ...prev.highlight.highlight, start: c.start, end: c.end },
+              highlight: {
+                ...prev.highlight.highlight,
+                start: c.start,
+                end: c.end,
+                // 若候選有 deterministic reason,用它;否則保留原 AI reason
+                reason: c.reasonText ?? prev.highlight.highlight.reason,
+              },
               candidateId: c.id,
             },
           }
@@ -689,11 +703,85 @@ export function VideoUploader() {
                             ? 'bg-white text-black'
                             : 'bg-white/10 hover:bg-white/20'
                         )}
+                        title={c.reasonText}
                       >
                         {formatCueTime(c.start)} · {c.duration.toFixed(0)}s
+                        {debugMode && c.scores && (
+                          <span className="ml-1 opacity-60">
+                            [{c.scores.totalScore.toFixed(2)}]
+                          </span>
+                        )}
                       </button>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* Debug mode:candidate scoring 明細 */}
+              {debugMode && hl.candidates.length > 0 && (
+                <div className="mb-3 rounded-lg bg-black/50 border border-yellow-500/40 p-3 overflow-x-auto">
+                  <p className="text-[11px] uppercase tracking-widest text-yellow-400/80 mb-2">
+                    debug: candidate scoring
+                  </p>
+                  <table className="text-[10px] tabular-nums w-full min-w-[720px]">
+                    <thead className="opacity-60">
+                      <tr>
+                        <th className="text-left pr-2 py-0.5">id</th>
+                        <th className="text-left pr-2 py-0.5">range</th>
+                        <th className="text-right pr-2">dur</th>
+                        <th className="text-right pr-2">total</th>
+                        <th className="text-right pr-2">comp</th>
+                        <th className="text-right pr-2">hook</th>
+                        <th className="text-right pr-2">ctx</th>
+                        <th className="text-right pr-2">spd</th>
+                        <th className="text-right pr-2">bnd</th>
+                        <th className="text-right pr-2">info</th>
+                        <th className="text-right pr-2">durS</th>
+                        <th className="text-right pr-2">−intro</th>
+                        <th className="text-right pr-2">−outro</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {hl.candidates.map((c) => {
+                        const s = c.scores;
+                        return (
+                          <tr
+                            key={c.id}
+                            className={cn(
+                              hl.candidateId === c.id
+                                ? 'text-yellow-300'
+                                : 'opacity-80'
+                            )}
+                          >
+                            <td className="pr-2 py-0.5">{c.id}</td>
+                            <td className="pr-2">
+                              {formatCueTime(c.start)}–{formatCueTime(c.end)}
+                            </td>
+                            <td className="text-right pr-2">{c.duration.toFixed(1)}s</td>
+                            <td className="text-right pr-2 font-bold">
+                              {s?.totalScore.toFixed(2) ?? '—'}
+                            </td>
+                            <td className="text-right pr-2">{s?.completeness.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.hook.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.contextIndependence.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.speechDensity.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.boundaryQuality.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.informationDensity.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2">{s?.durationScore.toFixed(2) ?? '—'}</td>
+                            <td className="text-right pr-2 text-red-300/80">
+                              {s?.introPenalty ? s.introPenalty.toFixed(2) : '—'}
+                            </td>
+                            <td className="text-right pr-2 text-red-300/80">
+                              {s?.outroPenalty ? s.outroPenalty.toFixed(2) : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  <p className="text-[10px] opacity-40 mt-2">
+                    加權:comp·.20 + hook·.15 + ctx/spd/bnd/info/durS 各·.10 − intro·.10 − outro·.05
+                  </p>
                 </div>
               )}
 

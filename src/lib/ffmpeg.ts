@@ -116,3 +116,47 @@ function guessExt(name: string): string {
   if (lower.endsWith('.m4v')) return '.m4v';
   return '.mp4';
 }
+
+/**
+ * 把一整支 MP3 依秒數切成多個 chunk。
+ * 只做 stream copy(不重編碼),很快。
+ *
+ * @param audioBlob  完整 MP3
+ * @param chunkSec   每段幾秒(建議 300 = 5 分鐘)
+ * @returns 每個 chunk 為一個 Blob;順序依時間軸
+ */
+export async function splitAudioIntoChunks(
+  audioBlob: Blob,
+  chunkSec: number = 300
+): Promise<Blob[]> {
+  const ffmpeg = await getFFmpeg();
+  const inputName = 'in_split.mp3';
+  const pattern = 'chunk_%03d.mp3';
+
+  await ffmpeg.writeFile(inputName, new Uint8Array(await audioBlob.arrayBuffer()));
+
+  await ffmpeg.exec([
+    '-i', inputName,
+    '-f', 'segment',
+    '-segment_time', String(chunkSec),
+    '-c', 'copy',
+    '-reset_timestamps', '1',
+    '-y',
+    pattern,
+  ]);
+
+  const chunks: Blob[] = [];
+  for (let i = 0; i < 200; i++) { // 上限 200 chunk(~16 小時,遠超使用場景)
+    const name = `chunk_${i.toString().padStart(3, '0')}.mp3`;
+    try {
+      const data = await ffmpeg.readFile(name);
+      chunks.push(new Blob([data as BlobPart], { type: 'audio/mpeg' }));
+      try { await ffmpeg.deleteFile(name); } catch {}
+    } catch {
+      break;
+    }
+  }
+
+  try { await ffmpeg.deleteFile(inputName); } catch {}
+  return chunks;
+}

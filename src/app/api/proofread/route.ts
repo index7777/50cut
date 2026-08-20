@@ -13,6 +13,8 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { checkRateLimit, getClientIp } from '@/lib/ratelimit';
 import { log } from '@/lib/logger';
+import { GEMINI_MODEL, geminiEndpoint } from '@/lib/ai-config';
+import { classifyGeminiError, type AiFailureReason } from '@/lib/ai-errors';
 import type { ApiError, ProofreadCorrection, ProofreadResponse } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -117,14 +119,20 @@ export async function POST(request: NextRequest) {
   );
 
   const key = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const model = GEMINI_MODEL;
+
+  const fallback = (reason: AiFailureReason): ProofreadResponse => ({
+    corrections: [],
+    ai: { proofread: { status: 'fallback', reason } },
+  });
+
   if (!key) {
     log.error('missing_gemini_key_proofread');
-    // 沒設定 key 不擋流程:回空 patch
-    return NextResponse.json<ProofreadResponse>({ corrections: [] });
+    // 沒設定 key 不擋流程:回空 patch,標記 fallback
+    return NextResponse.json<ProofreadResponse>(fallback('missing_key'));
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+  const url = geminiEndpoint(model, key);
 
   let geminiJson: {
     candidates?: { content?: { parts?: { text?: string }[] } }[];
@@ -144,19 +152,18 @@ export async function POST(request: NextRequest) {
     });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
-      const quota = resp.status === 429 && /quota|billing/i.test(errText);
+      const reason = classifyGeminiError(resp.status, errText);
       log.warn('proofread_failed', {
         status: resp.status,
-        quota,
+        reason,
         snippet: errText.slice(0, 200),
       });
-      // 校字是加分項,失敗不擋流程
-      return NextResponse.json<ProofreadResponse>({ corrections: [] });
+      return NextResponse.json<ProofreadResponse>(fallback(reason));
     }
     geminiJson = await resp.json();
   } catch (err) {
     log.warn('proofread_network_error', { msg: (err as Error).message });
-    return NextResponse.json<ProofreadResponse>({ corrections: [] });
+    return NextResponse.json<ProofreadResponse>(fallback('network_error'));
   }
 
   const raw = geminiJson.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '';
@@ -165,7 +172,7 @@ export async function POST(request: NextRequest) {
     parsed = JSON.parse(raw);
   } catch {
     log.warn('proofread_parse_fail', { snippet: raw.slice(0, 200) });
-    return NextResponse.json<ProofreadResponse>({ corrections: [] });
+    return NextResponse.json<ProofreadResponse>(fallback('invalid_response'));
   }
 
   // 驗證每個 patch:index 合法、from 必須逐字存在於該行、to 不得過長
@@ -199,7 +206,10 @@ export async function POST(request: NextRequest) {
     rejected,
   });
 
-  return NextResponse.json<ProofreadResponse>({ corrections });
+  return NextResponse.json<ProofreadResponse>({
+    corrections,
+    ai: { proofread: { status: 'success' } },
+  });
 }
 
 export async function GET() {
